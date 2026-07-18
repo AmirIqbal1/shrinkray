@@ -1,101 +1,131 @@
 # shrinkray 📼➡️📦
 
-Point it at a video file. Get a much smaller one back. That's it.
-
-No codec knowledge required — `shrinkray` figures out the best video
-encoder your machine supports and uses it sensibly, so you don't have
-to know what HEVC, AV1, CRF, or bitrate even mean.
-
-## Install (Ubuntu / Linux Mint)
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/shrinkray/main/install.sh | bash
-```
-
-This installs `ffmpeg` if you don't already have it, and puts
-`shrinkray` on your PATH.
-
-Or, clone it and install manually:
-
-```bash
-git clone https://github.com/YOUR_USERNAME/shrinkray.git
-cd shrinkray
-./install.sh
-```
-
-## Use it
+Point shrinkray at a movie. It creates a smaller copy and leaves the original
+alone.
 
 ```bash
 shrinkray movie.mkv
 ```
 
-That's the whole thing. It'll produce `movie.shrunk.mkv` at roughly
-500MB by default.
+The default output is `movie.shrunk.mkv`, with a target size of about 500 MB.
 
-Want it a different size, or better quality (slower)?
+## Install
+
+Shrinkray supports Ubuntu Server and Linux Mint. The installer adds `ffmpeg`
+with `apt-get` when it is missing, then installs the `shrinkray` command for
+your user.
 
 ```bash
-shrinkray movie.mkv --size 700 --quality best
+curl -fsSL https://raw.githubusercontent.com/AmirIqbal1/shinkray/main/install.sh | bash
 ```
 
-Got a folder full of films on your media server?
+Open a new terminal after installation, then check that everything is ready:
+
+```bash
+shrinkray doctor
+```
+
+To install from a clone instead:
+
+```bash
+git clone https://github.com/AmirIqbal1/shinkray.git
+cd shinkray
+./install.sh
+```
+
+For a system-wide installation in `/usr/local/bin`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AmirIqbal1/shinkray/main/install.sh | bash -s -- --system
+```
+
+The default user installation goes to `~/.local/bin` and does not need `sudo`
+unless `ffmpeg` must be installed.
+
+## Quick start
+
+On Ubuntu Server or Linux Mint, the basic workflow is the same:
+
+```bash
+shrinkray ~/Movies/movie.mkv
+```
+
+Choose another target size or spend more time improving compression:
+
+```bash
+shrinkray ~/Movies/movie.mkv --size 700 --quality best
+```
+
+Process one directory:
 
 ```bash
 shrinkray --batch ~/Movies --size 500
 ```
 
+Include its subdirectories:
+
+```bash
+shrinkray --batch ~/Movies --recursive --size 500
+```
+
+Software video encoding is CPU-intensive and may be slow, especially with
+`--quality best` or the explicitly requested AV1 codec. Start with the default
+HEVC mode unless you specifically need AV1.
+
 ## Options
 
 | Flag | What it does | Default |
 |---|---|---|
-| `--size <MB>` | Target output size | `500` |
-| `--quality <fast\|good\|best>` | Slower = better compression for the same size | `good` |
-| `--codec <auto\|hevc\|av1>` | Which encoder to use | `auto` (picks the best one available) |
-| `--container <mkv\|mp4>` | Output file format | `mkv` |
-| `--keep-all-audio` | Keep every audio track instead of just the first | off |
-| `--output <path>` | Custom output filename | `<name>.shrunk.<container>` |
-| `--batch <dir>` | Process every video in a folder | — |
-| `--dry-run` | Show what it would do, without doing it | off |
-| `-y` | Don't ask before overwriting | off |
+| `--size <MB>` | Target output size in whole megabytes | `500` |
+| `--quality <fast\|good\|best>` | Trade encoding time for compression quality | `good` |
+| `--codec <auto\|hevc\|av1>` | Select the video encoder | `auto` (HEVC) |
+| `--container <mkv\|mp4>` | Select the output container | `mkv` |
+| `--keep-all-audio` | Keep all audio tracks instead of the first one | off |
+| `--output <path>` | Set a custom output for one input file | automatic |
+| `--batch <dir>` | Process videos in a directory | — |
+| `--recursive` | Include subdirectories with `--batch` | off |
+| `--dry-run` | Show planned work without encoding | off |
+| `-y` | Replace an existing output without asking | off |
 
-## What it actually does (for the curious)
+Run `shrinkray --help` for usage examples.
 
-- Re-encodes the video using **AV1** if your system supports it
-  (better compression), falling back to **HEVC** automatically if not
-  — including if AV1 encoding fails partway through.
-- Calculates the bitrate needed to hit your target size based on the
-  film's length, and uses two-pass encoding (for HEVC) to hit it
-  accurately.
-- Drops extra audio tracks by default (commentary, alternate language
-  dubs) since those often account for hundreds of MB you're not using
-  — subtitles are kept, since they're tiny.
+## Safety
 
-## File formats: mkv vs mp4
+Shrinkray never deletes or replaces the source movie. It encodes to a temporary
+file ending in `.part`, validates that file with `ffprobe`, and only then moves
+it to the requested output name. Failed and interrupted encodes are cleaned up.
 
-- **Input**: shrinkray reads whatever ffmpeg can decode - mp4, mkv, avi,
-  mov, ts, whatever your file already is. No conversion needed first.
-- **Output**: defaults to **mkv**, because it's the most capable
-  container for this job - it can hold any subtitle format and modern
-  audio codecs without a fuss.
-- Pass `--container mp4` if you need maximum compatibility with older
-  smart TVs, phones, or media boxes that are picky about mkv.
-  **Trade-off**: Blu-ray rips almost always carry image-based (PGS)
-  subtitles, and mp4 simply can't contain those - so mp4 output drops
-  subtitles entirely. If you need to keep subtitles, stick with mkv
-  (which nearly everything modern - Plex, Jellyfin, Kodi, VLC - plays
-  natively anyway).
+MKV output keeps global metadata, chapters, and available subtitles. MP4 output
+drops subtitles because common movie subtitle formats are not always compatible
+with MP4. Audio is optional, so silent videos work too.
 
-## A note on quality
+The target size is approximate. Shrinkray warns when the requested target is not
+smaller than the source.
 
-Below a certain size, video quality genuinely has to give a little —
-that's true of any tool, not a shrinkray limitation. `--quality best`
-gets more out of the same file size by spending more time thinking
-about each frame, but for very aggressive size targets (e.g. squeezing
-a 2-hour film into 500MB) you may notice softness in busy scenes. If
-that matters to you, try a bigger `--size` first.
+## Diagnostics
+
+```bash
+shrinkray doctor
+```
+
+This shows the shrinkray version and installation path, the installed `ffmpeg`
+and `ffprobe` versions, and whether HEVC and AV1 software encoders are available.
 
 ## Uninstall
+
+For a user installation:
 
 ```bash
 rm ~/.local/bin/shrinkray
 ```
+
+For a system installation:
+
+```bash
+sudo rm /usr/local/bin/shrinkray
+```
+
+## Licence
+
+Shrinkray is free software licensed under the GNU General Public License,
+version 3.0 (GPL-3.0).
