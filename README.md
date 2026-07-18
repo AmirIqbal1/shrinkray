@@ -16,7 +16,7 @@ with `apt-get` when it is missing, then installs the `shrinkray` command for
 your user.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AmirIqbal1/shinkray/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/AmirIqbal1/shrinkray/main/install.sh | bash
 ```
 
 Open a new terminal after installation, then check that everything is ready:
@@ -28,15 +28,15 @@ shrinkray doctor
 To install from a clone instead:
 
 ```bash
-git clone https://github.com/AmirIqbal1/shinkray.git
-cd shinkray
+git clone https://github.com/AmirIqbal1/shrinkray
+cd shrinkray
 ./install.sh
 ```
 
 For a system-wide installation in `/usr/local/bin`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AmirIqbal1/shinkray/main/install.sh | bash -s -- --system
+curl -fsSL https://raw.githubusercontent.com/AmirIqbal1/shrinkray/main/install.sh | bash -s -- --system
 ```
 
 The default user installation goes to `~/.local/bin` and does not need `sudo`
