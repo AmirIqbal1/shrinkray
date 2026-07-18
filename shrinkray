@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+#
+# shrinkray - point it at a video, get a much smaller one back.
+# https://github.com/YOUR_USERNAME/shrinkray
+#
+# No codec knowledge required. Sensible defaults, safe fallbacks.
+#
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# ---------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------
+TARGET_MB=500
+QUALITY="good"       # fast | good | best
+CODEC="auto"          # auto | hevc | av1
+CONTAINER="mkv"       # mkv | mp4
+KEEP_ALL_AUDIO=false
+OUTPUT=""
+DRY_RUN=false
+FORCE=false
+BATCH_DIR=""
+INPUT=""
+
+VIDEO_EXTS="mkv mp4 m4v avi mov wmv flv webm ts"
+
+# ---------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------
+say()  { echo "==> $*"; }
+warn() { echo "!!  $*" >&2; }
+die()  { echo "xx  $*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+shrinkray v${VERSION} - shrink a video file to a target size, easily.
+
+USAGE:
+  shrinkray <file> [options]
+  shrinkray --batch <directory> [options]
+
+OPTIONS:
+  --size <MB>        Target output size in MB          (default: 500)
+  --quality <lvl>    fast | good | best                  (default: good)
+                      Trades encode time for how well it compresses
+                      at the same size. 'best' looks nicer but is slower.
+  --codec <name>     auto | hevc | av1                    (default: auto)
+                      auto picks the best encoder your system supports.
+  --container <fmt>  mkv | mp4                             (default: mkv)
+                      mkv handles multiple audio/subtitle tracks better;
+                      pick mp4 for max compatibility with older TVs/devices.
+  --keep-all-audio    Keep every audio track (default: keeps just the first
+                      and drops commentary/extra-language tracks)
+  --output <path>     Output file path (default: <name>.shrunk.<container>)
+  --batch <dir>       Process every video file in a directory
+  --dry-run            Show what would happen, without encoding
+  -y                   Don't ask before overwriting an existing output
+  -h, --help           Show this help
+  --version            Show version
+
+EXAMPLES:
+  shrinkray movie.mkv
+  shrinkray movie.mkv --size 700 --quality best
+  shrinkray --batch ~/Movies --size 500
+
+WHAT IT DOES, IN PLAIN ENGLISH:
+  It re-encodes the video so it takes up roughly the size you ask for,
+  using whichever modern, efficient video codec (AV1 or HEVC) your
+  ffmpeg install supports. It also drops audio tracks you almost
+  certainly don't use (commentary, extra language dubs) since those
+  can eat hundreds of MB for nothing. Subtitles are kept - they're tiny.
+EOF
+}
+
+need_bin() {
+  command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not installed. Run install.sh first."
+}
+
+human_size() {
+  # $1 = path
+  du -m "$1" 2>/dev/null | cut -f1
+}
+
+is_video_file() {
+  local ext="${1##*.}"
+  ext="$(echo "$ext" | tr '[:upper:]' '[:lower:]')"
+  for e in $VIDEO_EXTS; do
+    [ "$ext" = "$e" ] && return 0
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------
+# Parse args
+# ---------------------------------------------------------------
+if [ $# -eq 0 ]; then
+  usage
+  exit 1
+fi
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --size) TARGET_MB="$2"; shift 2 ;;
+    --quality) QUALITY="$2"; shift 2 ;;
+    --codec) CODEC="$2"; shift 2 ;;
+    --container) CONTAINER="$2"; shift 2 ;;
+    --keep-all-audio) KEEP_ALL_AUDIO=true; shift ;;
+    --output) OUTPUT="$2"; shift 2 ;;
+    --batch) BATCH_DIR="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    -y) FORCE=true; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --version) echo "shrinkray v${VERSION}"; exit 0 ;;
+    -*) die "Unknown option: $1 (see --help)" ;;
+    *) INPUT="$1"; shift ;;
+  esac
+done
+
+case "$QUALITY" in fast|good|best) ;; *) die "--quality must be fast, good, or best" ;; esac
+case "$CODEC" in auto|hevc|av1) ;; *) die "--codec must be auto, hevc, or av1" ;; esac
+case "$CONTAINER" in mkv|mp4) ;; *) die "--container must be mkv or mp4" ;; esac
+
+need_bin ffmpeg
+need_bin ffprobe
+
+# ---------------------------------------------------------------
+# Detect what this ffmpeg install can actually do
+# ---------------------------------------------------------------
+HAS_SVTAV1=false
+HAS_X265=false
+ffmpeg -hide_banner -encoders 2>/dev/null | grep -q "libsvtav1" && HAS_SVTAV1=true
+ffmpeg -hide_banner -encoders 2>/dev/null | grep -q "libx265"   && HAS_X265=true
+
+if [ "$HAS_SVTAV1" = false ] && [ "$HAS_X265" = false ]; then
+  die "Your ffmpeg build has neither AV1 (libsvtav1) nor HEVC (libx265) support. Try: sudo apt install ffmpeg"
+fi
+
+case "$CODEC" in
+  auto)
+    if [ "$HAS_SVTAV1" = true ]; then CODEC="av1"; else CODEC="hevc"; fi
+    ;;
+  av1)
+    [ "$HAS_SVTAV1" = true ] || die "AV1 (libsvtav1) isn't available in your ffmpeg build."
+    ;;
+  hevc)
+    [ "$HAS_X265" = true ] || die "HEVC (libx265) isn't available in your ffmpeg build."
+    ;;
+esac
+
+case "$QUALITY" in
+  fast) X265_PRESET="fast";     SVT_PRESET=8 ;;
+  good) X265_PRESET="slow";     SVT_PRESET=6 ;;
+  best) X265_PRESET="veryslow"; SVT_PRESET=4 ;;
+esac
+
+AUDIO_KBPS=128
+
+# MP4 has patchy support for Opus audio, and Blu-ray rips almost always
+# carry image-based (PGS) subtitles that MP4 can't hold at all - so for
+# mp4 output, use AAC and drop subtitles rather than fail on them.
+if [ "$CONTAINER" = "mp4" ]; then
+  AV1_AUDIO_CODEC="aac"
+  SUB_ARGS=()
+else
+  AV1_AUDIO_CODEC="libopus"
+  SUB_ARGS=(-map 0:s? -c:s copy)
+fi
+
+# ---------------------------------------------------------------
+# Core: process a single file
+# ---------------------------------------------------------------
+process_file() {
+  local input="$1"
+  local target_mb="$2"
+  local output="$3"
+  local codec="$4"
+
+  [ -f "$input" ] || { warn "Not found, skipping: $input"; return 1; }
+
+  local duration duration_int
+  duration="$(ffprobe -v error -show_entry format=duration -of csv=p=0 "$input" 2>/dev/null || echo 0)"
+  duration_int="${duration%.*}"
+  [ -z "$duration_int" ] && duration_int=0
+
+  if [ "$duration_int" -le 0 ]; then
+    warn "Couldn't read duration, skipping: $input"
+    return 1
+  fi
+
+  local total_kbit total_kbps video_kbps
+  total_kbit=$(( target_mb * 8192 ))
+  total_kbps=$(( total_kbit / duration_int ))
+  video_kbps=$(( total_kbps - AUDIO_KBPS ))
+
+  if [ "$video_kbps" -lt 150 ]; then
+    warn "$(basename "$input"): target of ${target_mb}MB is very small for its"
+    warn "  length ($((duration_int/60)) min). Quality will suffer noticeably."
+    warn "  Consider a bigger --size, or accept softer picture quality."
+  fi
+
+  local audio_map="0:a:0"
+  [ "$KEEP_ALL_AUDIO" = true ] && audio_map="0:a"
+
+  local orig_mb
+  orig_mb="$(human_size "$input")"
+
+  echo
+  say "File:      $(basename "$input")"
+  say "Length:    $((duration_int/60)) min"
+  say "Codec:     $codec"
+  say "Quality:   $QUALITY"
+  say "Target:    ${target_mb} MB  (currently ${orig_mb} MB)"
+  say "Output:    $output"
+  if [ "$CONTAINER" = "mp4" ]; then
+    say "Note:      mp4 output - subtitles will be dropped (mp4 can't hold"
+    say "           Blu-ray-style image subtitles). Use --container mkv to keep them."
+  fi
+
+  if [ "$DRY_RUN" = true ]; then
+    say "(dry run - not encoding)"
+    return 0
+  fi
+
+  if [ -e "$output" ] && [ "$FORCE" = false ]; then
+    read -r -p "Output already exists. Overwrite? [y/N] " ans
+    case "$ans" in y|Y) ;; *) warn "Skipping $(basename "$input")"; return 1 ;; esac
+  fi
+
+  local workdir
+  workdir="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$workdir'" RETURN
+
+  local encode_ok=false
+
+  if [ "$codec" = "av1" ]; then
+    say "Encoding with AV1... this can take a while, go make a coffee."
+    if ffmpeg -y -hide_banner -loglevel warning -stats \
+        -i "$input" -map 0:v:0 -map "$audio_map" "${SUB_ARGS[@]}" \
+        -c:v libsvtav1 -preset "$SVT_PRESET" -b:v "${video_kbps}k" \
+        -svtav1-params "rc=1" \
+        -c:a "$AV1_AUDIO_CODEC" -b:a "${AUDIO_KBPS}k" \
+        "$output"; then
+      encode_ok=true
+    else
+      warn "AV1 encode failed on this system - falling back to HEVC."
+      codec="hevc"
+    fi
+  fi
+
+  if [ "$codec" = "hevc" ] && [ "$encode_ok" = false ]; then
+    say "Encoding with HEVC (pass 1 of 2)..."
+    ffmpeg -y -hide_banner -loglevel warning -stats \
+      -i "$input" \
+      -c:v libx265 -preset "$X265_PRESET" -b:v "${video_kbps}k" \
+      -x265-params "pass=1:log-level=error" \
+      -passlogfile "$workdir/x265log" \
+      -an -f null /dev/null
+
+    say "Encoding with HEVC (pass 2 of 2)..."
+    ffmpeg -y -hide_banner -loglevel warning -stats \
+      -i "$input" -map 0:v:0 -map "$audio_map" "${SUB_ARGS[@]}" \
+      -c:v libx265 -preset "$X265_PRESET" -b:v "${video_kbps}k" \
+      -x265-params "pass=2:log-level=error" \
+      -passlogfile "$workdir/x265log" \
+      -c:a aac -b:a "${AUDIO_KBPS}k" \
+      "$output"
+    encode_ok=true
+  fi
+
+  if [ "$encode_ok" = true ]; then
+    local new_mb pct
+    new_mb="$(human_size "$output")"
+    pct=$(( 100 - (new_mb * 100 / orig_mb) ))
+    say "Done: ${orig_mb} MB -> ${new_mb} MB (${pct}% smaller)"
+    return 0
+  else
+    warn "Failed to encode $(basename "$input")"
+    return 1
+  fi
+}
+
+default_output_for() {
+  local input="$1"
+  local dir base
+  dir="$(dirname "$input")"
+  base="$(basename "${input%.*}")"
+  echo "${dir}/${base}.shrunk.${CONTAINER}"
+}
+
+# ---------------------------------------------------------------
+# Run: single file or batch
+# ---------------------------------------------------------------
+if [ -n "$BATCH_DIR" ]; then
+  [ -d "$BATCH_DIR" ] || die "Not a directory: $BATCH_DIR"
+
+  say "Scanning $BATCH_DIR for video files..."
+  mapfile -t FILES < <(find "$BATCH_DIR" -maxdepth 1 -type f | while read -r f; do
+    is_video_file "$f" && [[ "$f" != *".shrunk."* ]] && echo "$f"
+  done)
+
+  if [ "${#FILES[@]}" -eq 0 ]; then
+    say "No video files found."
+    exit 0
+  fi
+
+  say "Found ${#FILES[@]} file(s)."
+  TOTAL_ORIG=0
+  TOTAL_NEW=0
+  for f in "${FILES[@]}"; do
+    out="$(default_output_for "$f")"
+    before="$(human_size "$f")"
+    if process_file "$f" "$TARGET_MB" "$out" "$CODEC"; then
+      after="$(human_size "$out" 2>/dev/null || echo 0)"
+      TOTAL_ORIG=$((TOTAL_ORIG + before))
+      TOTAL_NEW=$((TOTAL_NEW + after))
+    fi
+  done
+
+  if [ "$DRY_RUN" = false ] && [ "$TOTAL_ORIG" -gt 0 ]; then
+    echo
+    say "Batch complete: ${TOTAL_ORIG} MB -> ${TOTAL_NEW} MB total"
+  fi
+
+else
+  [ -n "$INPUT" ] || { usage; exit 1; }
+  [ -f "$INPUT" ] || die "File not found: $INPUT"
+  OUTPUT="${OUTPUT:-$(default_output_for "$INPUT")}"
+  process_file "$INPUT" "$TARGET_MB" "$OUTPUT" "$CODEC"
+fi
