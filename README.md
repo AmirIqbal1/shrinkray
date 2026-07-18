@@ -3,11 +3,25 @@
 Point shrinkray at a movie. It creates a smaller copy and leaves the original
 alone.
 
+## Easy guided mode
+
+Run Shrinkray without any options:
+
 ```bash
-shrinkray movie.mkv
+shrinkray
 ```
 
-The default output is `movie.shrunk.mkv`, with a target size of about 500 MB.
+It will ask you to choose a movie, how small you want it, and whether you need
+MKV or MP4 compatibility. The guided prompts work in a local Linux Mint
+terminal and over SSH on Ubuntu Server.
+
+If you prefer an advanced direct command, provide the movie and target size:
+
+```bash
+shrinkray movie.mkv --size 700
+```
+
+Direct mode creates `movie.shrunk.mkv` by default.
 
 ## Install
 

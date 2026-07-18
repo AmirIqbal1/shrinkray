@@ -5,7 +5,7 @@
 #
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 TARGET_MB=500
 QUALITY="good"
@@ -32,6 +32,8 @@ usage() {
 shrinkray v${VERSION} - shrink a video file to a target size, safely.
 
 USAGE:
+  shrinkray
+  shrinkray guided [--dry-run]
   shrinkray <file> [options]
   shrinkray --batch <directory> [--recursive] [options]
   shrinkray doctor
@@ -52,6 +54,8 @@ OPTIONS:
   --version           Show version
 
 EXAMPLES:
+  shrinkray
+  shrinkray guided --dry-run
   shrinkray movie.mkv
   shrinkray movie.mkv --size 700 --quality best
   shrinkray --batch ~/Movies --recursive --size 500
@@ -72,7 +76,11 @@ cleanup_active() {
 
 handle_signal() {
   local exit_code="$1"
-  warn "Encoding interrupted; removing the temporary output."
+  if [ -n "$ACTIVE_TEMP" ]; then
+    warn "Encoding interrupted; removing the temporary output."
+  else
+    warn "Cancelled."
+  fi
   cleanup_active
   trap - EXIT
   exit "$exit_code"
@@ -183,6 +191,239 @@ default_output_for() {
   dir="$(dirname -- "$input")"
   base="$(basename -- "${input%.*}")"
   printf '%s/%s.shrunk.%s\n' "$dir" "$base" "$CONTAINER"
+}
+
+guided_prompt() {
+  local prompt="$1"
+  REPLY=""
+  if [ -t 0 ]; then
+    IFS= read -r -e -p "$prompt" REPLY
+  else
+    printf '%s' "$prompt"
+    IFS= read -r REPLY
+  fi
+}
+
+strip_surrounding_quotes() {
+  local value="$1"
+  local first last
+  if [ "${#value}" -ge 2 ]; then
+    first="${value:0:1}"
+    last="${value: -1}"
+    if { [ "$first" = '"' ] && [ "$last" = '"' ]; } || \
+       { [ "$first" = "'" ] && [ "$last" = "'" ]; }; then
+      value="${value:1:${#value}-2}"
+    fi
+  fi
+  printf '%s\n' "$value"
+}
+
+format_duration() {
+  local duration="$1"
+  local total_seconds hours minutes seconds
+  total_seconds="${duration%%.*}"
+  [[ "$total_seconds" =~ ^[0-9]+$ ]] || total_seconds=0
+  hours=$((total_seconds / 3600))
+  minutes=$(((total_seconds % 3600) / 60))
+  seconds=$((total_seconds % 60))
+  printf '%02d:%02d:%02d\n' "$hours" "$minutes" "$seconds"
+}
+
+collect_ffprobe_info() {
+  local input="$1"
+  local probe_output key value
+  PROBE_DURATION=""
+  PROBE_WIDTH=""
+  PROBE_HEIGHT=""
+  PROBE_CODEC=""
+
+  probe_output="$(ffprobe -v error -select_streams v:0 \
+    -show_entries stream=codec_name,width,height:format=duration \
+    -of default=noprint_wrappers=1 "$input" 2>/dev/null)" || return 1
+
+  while IFS='=' read -r key value; do
+    case "$key" in
+      codec_name) PROBE_CODEC="$value" ;;
+      width) PROBE_WIDTH="$value" ;;
+      height) PROBE_HEIGHT="$value" ;;
+      duration) PROBE_DURATION="$value" ;;
+    esac
+  done <<< "$probe_output"
+
+  [[ "$PROBE_DURATION" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+  [[ "$PROBE_WIDTH" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ "$PROBE_HEIGHT" =~ ^[1-9][0-9]*$ ]] || return 1
+  [ -n "$PROBE_CODEC" ] || return 1
+}
+
+calculate_preset_size() {
+  local original_bytes="$1"
+  local percent="$2"
+  local target_bytes target_mb
+  target_bytes=$(( (original_bytes * percent + 99) / 100 ))
+  target_mb=$(( (target_bytes + 1048575) / 1048576 ))
+  [ "$target_mb" -ge 1 ] || target_mb=1
+  printf '%s\n' "$target_mb"
+}
+
+guided_mode() {
+  local input answer original_bytes original_mb formatted_duration
+  local audio_description
+
+  need_bin ffmpeg
+  need_bin ffprobe
+
+  printf '\nShrinkray guided mode\n'
+  printf 'Choose a movie, choose how small you want it, and Shrinkray handles the rest.\n\n'
+
+  while true; do
+    if ! guided_prompt "Input movie path (or q to quit): "; then
+      warn "No input received; guided mode cancelled."
+      return 2
+    fi
+    input="$(strip_surrounding_quotes "$REPLY")"
+    case "${input,,}" in
+      q|quit)
+        say "Guided mode cancelled."
+        return 2
+        ;;
+    esac
+    if [ ! -f "$input" ]; then
+      warn "Not a regular file: $input"
+      continue
+    fi
+    if ! is_video_file "$input"; then
+      warn "Unsupported video extension. Supported: $VIDEO_EXTS"
+      continue
+    fi
+    break
+  done
+
+  if ! collect_ffprobe_info "$input"; then
+    warn "ffprobe could not read a valid video stream from: $input"
+    return 1
+  fi
+
+  original_bytes="$(file_size_bytes "$input")"
+  original_mb="$(human_size_mb "$original_bytes")"
+  formatted_duration="$(format_duration "$PROBE_DURATION")"
+
+  printf '\nMovie details\n'
+  printf '  Filename: %s\n' "$(basename -- "$input")"
+  printf '  Original size: %s MB\n' "$original_mb"
+  printf '  Duration: %s\n' "$formatted_duration"
+  printf '  Resolution: %sx%s\n' "$PROBE_WIDTH" "$PROBE_HEIGHT"
+  printf '  Video codec: %s\n' "$PROBE_CODEC"
+
+  while true; do
+    printf '\nHow small should it be?\n'
+    printf '  1. Balanced — recommended (about 60%%, quality good)\n'
+    printf '  2. Smaller file (about 40%%, quality good)\n'
+    printf '  3. Better quality (about 75%%, quality best)\n'
+    printf '  4. Exact size\n'
+    if ! guided_prompt "Choice [1]: "; then
+      warn "No input received; guided mode cancelled."
+      return 2
+    fi
+    answer="$REPLY"
+    case "$answer" in
+      ""|1)
+        TARGET_MB="$(calculate_preset_size "$original_bytes" 60)"
+        QUALITY="good"
+        break
+        ;;
+      2)
+        TARGET_MB="$(calculate_preset_size "$original_bytes" 40)"
+        QUALITY="good"
+        break
+        ;;
+      3)
+        TARGET_MB="$(calculate_preset_size "$original_bytes" 75)"
+        QUALITY="best"
+        break
+        ;;
+      4)
+        while true; do
+          if ! guided_prompt "Exact target size in MB: "; then
+            warn "No input received; guided mode cancelled."
+            return 2
+          fi
+          if [[ "$REPLY" =~ ^[1-9][0-9]*$ ]]; then
+            TARGET_MB="$REPLY"
+            QUALITY="good"
+            break 2
+          fi
+          warn "Enter a positive whole number of megabytes."
+        done
+        ;;
+      *) warn "Choose 1, 2, 3, or 4." ;;
+    esac
+  done
+
+  while true; do
+    printf '\nOutput compatibility\n'
+    printf '  1. MKV — recommended, keeps compatible subtitles\n'
+    printf '  2. MP4 — maximum device compatibility, drops subtitles\n'
+    if ! guided_prompt "Choice [1]: "; then
+      warn "No input received; guided mode cancelled."
+      return 2
+    fi
+    case "$REPLY" in
+      ""|1) CONTAINER="mkv"; break ;;
+      2) CONTAINER="mp4"; break ;;
+      *) warn "Choose 1 or 2." ;;
+    esac
+  done
+
+  while true; do
+    printf '\nAudio\n'
+    printf '  1. Keep the first audio track — recommended\n'
+    printf '  2. Keep every audio track\n'
+    if ! guided_prompt "Choice [1]: "; then
+      warn "No input received; guided mode cancelled."
+      return 2
+    fi
+    case "$REPLY" in
+      ""|1)
+        KEEP_ALL_AUDIO=false
+        audio_description="First audio track"
+        break
+        ;;
+      2)
+        KEEP_ALL_AUDIO=true
+        audio_description="Every audio track"
+        break
+        ;;
+      *) warn "Choose 1 or 2." ;;
+    esac
+  done
+
+  OUTPUT="$(default_output_for "$input")"
+  printf '\nReady to shrink\n'
+  printf '  Input: %s\n' "$input"
+  printf '  Original size: %s MB\n' "$original_mb"
+  printf '  Target size: %s MB\n' "$TARGET_MB"
+  printf '  Quality: %s\n' "$QUALITY"
+  printf '  Container: %s\n' "${CONTAINER^^}"
+  printf '  Audio handling: %s\n' "$audio_description"
+  printf '  Output path: %s\n' "$OUTPUT"
+
+  while true; do
+    if ! guided_prompt "Start shrinking now? [Y/n] "; then
+      warn "No input received; guided mode cancelled."
+      return 2
+    fi
+    case "${REPLY,,}" in
+      ""|y|yes) break ;;
+      n|no)
+        say "Guided mode cancelled; no files were created."
+        return 2
+        ;;
+      *) warn "Answer y or n." ;;
+    esac
+  done
+
+  GUIDED_INPUT="$input"
 }
 
 validate_output() {
@@ -383,54 +624,80 @@ if [ "${1-}" = "doctor" ]; then
   exit 0
 fi
 
+GUIDED_MODE=false
+GUIDED_INPUT=""
+declare -a INPUTS=()
 if [ "$#" -eq 0 ]; then
-  usage
-  exit 1
+  if [ -t 0 ] && [ -t 1 ]; then
+    GUIDED_MODE=true
+  else
+    warn "No arguments were provided and no interactive terminal is available."
+    usage >&2
+    exit 1
+  fi
+elif [ "$1" = "guided" ]; then
+  GUIDED_MODE=true
+  shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dry-run) DRY_RUN=true; shift ;;
+      *) die "guided mode only supports --dry-run; unsupported argument: $1" ;;
+    esac
+  done
 fi
 
-declare -a INPUTS=()
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --size)
-      require_option_value "$1" "$#" "${2-}"
-      TARGET_MB="$2"
-      shift 2
-      ;;
-    --quality)
-      require_option_value "$1" "$#" "${2-}"
-      QUALITY="$2"
-      shift 2
-      ;;
-    --codec)
-      require_option_value "$1" "$#" "${2-}"
-      CODEC="$2"
-      shift 2
-      ;;
-    --container)
-      require_option_value "$1" "$#" "${2-}"
-      CONTAINER="$2"
-      shift 2
-      ;;
-    --output)
-      require_option_value "$1" "$#" "${2-}"
-      OUTPUT="$2"
-      shift 2
-      ;;
-    --batch)
-      require_option_value "$1" "$#" "${2-}"
-      BATCH_DIR="$2"
-      shift 2
-      ;;
-    --keep-all-audio) KEEP_ALL_AUDIO=true; shift ;;
-    --recursive) RECURSIVE=true; shift ;;
-    --dry-run) DRY_RUN=true; shift ;;
-    -y) FORCE=true; shift ;;
-    -h|--help) usage; exit 0 ;;
-    --version) printf 'shrinkray v%s\n' "$VERSION"; exit 0 ;;
-    -*) die "Unknown option: $1 (see --help)" ;;
-    *) INPUTS+=("$1"); shift ;;
-  esac
-done
+if [ "$GUIDED_MODE" = true ]; then
+  if guided_mode; then
+    INPUTS=("$GUIDED_INPUT")
+  else
+    guided_result=$?
+    [ "$guided_result" -eq 2 ] && exit 0
+    exit 1
+  fi
+else
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --size)
+        require_option_value "$1" "$#" "${2-}"
+        TARGET_MB="$2"
+        shift 2
+        ;;
+      --quality)
+        require_option_value "$1" "$#" "${2-}"
+        QUALITY="$2"
+        shift 2
+        ;;
+      --codec)
+        require_option_value "$1" "$#" "${2-}"
+        CODEC="$2"
+        shift 2
+        ;;
+      --container)
+        require_option_value "$1" "$#" "${2-}"
+        CONTAINER="$2"
+        shift 2
+        ;;
+      --output)
+        require_option_value "$1" "$#" "${2-}"
+        OUTPUT="$2"
+        shift 2
+        ;;
+      --batch)
+        require_option_value "$1" "$#" "${2-}"
+        BATCH_DIR="$2"
+        shift 2
+        ;;
+      --keep-all-audio) KEEP_ALL_AUDIO=true; shift ;;
+      --recursive) RECURSIVE=true; shift ;;
+      --dry-run) DRY_RUN=true; shift ;;
+      -y) FORCE=true; shift ;;
+      -h|--help) usage; exit 0 ;;
+      --version) printf 'shrinkray v%s\n' "$VERSION"; exit 0 ;;
+      -*) die "Unknown option: $1 (see --help)" ;;
+      *) INPUTS+=("$1"); shift ;;
+    esac
+  done
+fi
 
 [[ "$TARGET_MB" =~ ^[1-9][0-9]*$ ]] || die "--size must be a positive whole number of megabytes."
 case "$QUALITY" in fast|good|best) ;; *) die "--quality must be fast, good, or best." ;; esac
