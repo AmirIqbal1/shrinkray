@@ -42,6 +42,31 @@ go run ./cmd/shrinkray-server \
 Then open <http://127.0.0.1:8787>. The server listens only on localhost by
 default.
 
+Repeat `--root` to expose separate media libraries while keeping one global
+encoding queue:
+
+```bash
+shrinkray-server \
+  --root /media/movies \
+  --root /media/tv \
+  --listen 127.0.0.1:8787 \
+  --shrinkray-bin ./shrinkray
+```
+
+Library names are derived from directory names (`movies` becomes `Movies` and
+`tv` becomes `TV`). Give them explicit dashboard names with `Name=/path`:
+
+```bash
+shrinkray-server \
+  --root "Movies=/media/movies" \
+  --root "TV Shows=/media/tv" \
+  --shrinkray-bin ./shrinkray
+```
+
+Separate roots are safer than `--root /media`: Shrinkray can browse only the
+configured Movies and TV libraries, not unrelated folders that happen to live
+under `/media`. Configured roots must not overlap.
+
 For safe access to a remote server, keep that default and open an SSH tunnel:
 
 ```bash
@@ -62,13 +87,14 @@ go run ./cmd/shrinkray-server \
 **The dashboard has no authentication. Do not expose it directly to the public
 internet. Use localhost, SSH tunnelling, a trusted LAN, Tailscale, or a
 protected reverse proxy.** Every browsed or submitted path is resolved against
-`--root`; traversal, symlink escapes, unsupported files, and existing outputs
-are rejected.
+the selected `--root`; traversal, symlink escapes, unsupported files, and
+existing outputs are rejected. Absolute configured root paths are not exposed
+through the browser API.
 
 Additional server flags are `--state-dir` (default
 `~/.local/share/shrinkray/server`) and `--listen` (default
-`127.0.0.1:8787`). The server version is independent of the Bash CLI and starts
-at `shrinkray-server v0.1.0`.
+`127.0.0.1:8787`). The server version is independent of the Bash CLI; this
+multi-library release is `shrinkray-server v0.2.0`.
 
 ## Install
 

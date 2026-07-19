@@ -51,17 +51,34 @@ func (r *controlledRunner) Run(ctx context.Context, job *Job, stage func(string)
 
 func managerFixture(t *testing.T) (*JobManager, *controlledRunner, string) {
 	t.Helper()
-	root, dir := makeTestRoot(t)
+	dir := t.TempDir()
+	roots, err := NewRootRegistry([]string{"Movies=" + dir})
+	if err != nil {
+		t.Fatal(err)
+	}
 	runner := newControlledRunner()
-	manager := NewJobManager(root, runner)
+	manager := NewJobManager(roots, runner)
 	t.Cleanup(manager.Close)
 	return manager, runner, dir
+}
+
+func multiRootManagerFixture(t *testing.T) (*JobManager, *controlledRunner, string, string) {
+	t.Helper()
+	movies, tv := makeRootDirectories(t)
+	roots, err := NewRootRegistry([]string{"Movies=" + movies, "TV=" + tv})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := newControlledRunner()
+	manager := NewJobManager(roots, runner)
+	t.Cleanup(manager.Close)
+	return manager, runner, movies, tv
 }
 
 func submitTestJob(t *testing.T, manager *JobManager, dir, name string) *Job {
 	t.Helper()
 	writeTestFile(t, filepath.Join(dir, name))
-	job, err := manager.Submit(name, "balanced", "mkv", false, 0)
+	job, err := manager.Submit("movies", name, "balanced", "mkv", false, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +136,11 @@ func TestQueuedJobLogsSerializeAsEmptyArray(t *testing.T) {
 }
 
 func TestJobsEndpointSerializesEmptyQueueAsArray(t *testing.T) {
-	server, err := NewServer(t.TempDir(), "unused-shrinkray", t.TempDir(), "test")
+	roots, err := NewRootRegistry([]string{"Movies=" + t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(roots, "unused-shrinkray", t.TempDir(), "test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,6 +199,60 @@ func TestQueueOrderAndOnlyOneRunning(t *testing.T) {
 	}
 }
 
+func TestJobsFromDifferentRootsShareOneQueue(t *testing.T) {
+	manager, runner, movies, tv := multiRootManagerFixture(t)
+	writeTestFile(t, filepath.Join(movies, "film.mkv"))
+	writeTestFile(t, filepath.Join(tv, "episode.mkv"))
+	movieJob, err := manager.Submit("movies", "film.mkv", "balanced", "mkv", false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tvJob, err := manager.Submit("tv", "episode.mkv", "smaller", "mkv", false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if movieJob.RootID != "movies" || movieJob.RootLabel != "Movies" || tvJob.RootID != "tv" || tvJob.RootLabel != "TV" {
+		t.Fatalf("jobs recorded incorrect roots: %#v, %#v", movieJob, tvJob)
+	}
+
+	for _, job := range []*Job{movieJob, tvJob} {
+		select {
+		case startedID := <-runner.started:
+			if startedID != job.ID {
+				t.Fatalf("started job %s; want %s", startedID, job.ID)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for cross-root job")
+		}
+		runner.release <- struct{}{}
+		waitForState(t, manager, job.ID, StateCompleted)
+	}
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	if runner.maxRunning != 1 {
+		t.Fatalf("maximum concurrent cross-root jobs = %d; want 1", runner.maxRunning)
+	}
+}
+
+func TestOutputReservationsUseCanonicalPathsAcrossRoots(t *testing.T) {
+	manager, _, movies, tv := multiRootManagerFixture(t)
+	movieSource := filepath.Join(movies, "movie.mkv")
+	writeTestFile(t, movieSource)
+	writeTestFile(t, filepath.Join(tv, "movie.mkv"))
+	if err := os.Symlink(movieSource, filepath.Join(movies, "alias.mkv")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Submit("movies", "movie.mkv", "balanced", "mkv", false, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Submit("movies", "alias.mkv", "balanced", "mkv", false, 0); err == nil {
+		t.Fatal("Submit accepted a second alias targeting the same canonical output")
+	}
+	if _, err := manager.Submit("tv", "movie.mkv", "balanced", "mkv", false, 0); err != nil {
+		t.Fatalf("Submit rejected an independent output in another root: %v", err)
+	}
+}
+
 func TestCancelQueuedJob(t *testing.T) {
 	manager, runner, dir := managerFixture(t)
 	first := submitTestJob(t, manager, dir, "first.mkv")
@@ -200,7 +275,7 @@ func TestRejectExistingOutput(t *testing.T) {
 	manager, _, dir := managerFixture(t)
 	writeTestFile(t, filepath.Join(dir, "movie.mkv"))
 	writeTestFile(t, filepath.Join(dir, "movie.shrunk.mkv"))
-	if _, err := manager.Submit("movie.mkv", "balanced", "mkv", false, 0); err == nil {
+	if _, err := manager.Submit("movies", "movie.mkv", "balanced", "mkv", false, 0); err == nil {
 		t.Fatal("Submit accepted a job whose output exists")
 	}
 }
@@ -220,7 +295,7 @@ func TestSubmitRejectsDirectory(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, "folder.mkv"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.Submit("folder.mkv", "balanced", "mkv", false, 0); err == nil {
+	if _, err := manager.Submit("movies", "folder.mkv", "balanced", "mkv", false, 0); err == nil {
 		t.Fatal("Submit accepted a directory")
 	}
 }

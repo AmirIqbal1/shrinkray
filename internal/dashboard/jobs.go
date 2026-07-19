@@ -35,6 +35,8 @@ type JobSettings struct {
 
 type Job struct {
 	ID             string      `json:"id"`
+	RootID         string      `json:"root_id"`
+	RootLabel      string      `json:"root_label"`
 	Path           string      `json:"path"`
 	Filename       string      `json:"filename"`
 	OutputPath     string      `json:"output_path"`
@@ -51,7 +53,8 @@ type Job struct {
 	SavedPercent   float64     `json:"saved_percent,omitempty"`
 	Failure        string      `json:"failure,omitempty"`
 
-	cancel context.CancelFunc
+	cancel    context.CancelFunc
+	outputAbs string
 }
 
 type RunResult struct {
@@ -63,21 +66,28 @@ type JobRunner interface {
 }
 
 type CLIRunner struct {
-	root         *SafeRoot
+	roots        *RootRegistry
 	shrinkrayBin string
 }
 
-func NewCLIRunner(root *SafeRoot, shrinkrayBin string) *CLIRunner {
-	return &CLIRunner{root: root, shrinkrayBin: shrinkrayBin}
+func NewCLIRunner(roots *RootRegistry, shrinkrayBin string) *CLIRunner {
+	return &CLIRunner{roots: roots, shrinkrayBin: shrinkrayBin}
 }
 
 func (r *CLIRunner) Run(ctx context.Context, job *Job, stage func(string), logLine func(string)) (RunResult, error) {
 	stage("Inspecting")
-	source, _, err := r.root.ResolveVideo(job.Path)
+	mediaRoot, err := r.roots.Get(job.RootID)
+	if err != nil {
+		return RunResult{}, errors.New("configured media root is no longer available")
+	}
+	source, _, err := mediaRoot.Root.ResolveVideo(job.Path)
 	if err != nil {
 		return RunResult{}, errors.New("source movie is no longer available")
 	}
 	output := outputPath(source, job.Settings.Container)
+	if job.outputAbs != "" && output != job.outputAbs {
+		return RunResult{}, errors.New("intended output path changed")
+	}
 	if _, err := os.Lstat(output); err == nil {
 		return RunResult{}, errors.New("intended output already exists")
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -119,7 +129,7 @@ func (r *CLIRunner) Run(ctx context.Context, job *Job, stage func(string), logLi
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
-		line := strings.ReplaceAll(scanner.Text(), r.root.Path(), "[movie root]")
+		line := r.roots.Redact(scanner.Text())
 		logLine(line)
 		if parsed := stageFromLog(line); parsed != "" {
 			stage(parsed)
@@ -165,7 +175,7 @@ func stageFromLog(line string) string {
 type JobManager struct {
 	mu         sync.Mutex
 	cond       *sync.Cond
-	root       *SafeRoot
+	roots      *RootRegistry
 	runner     JobRunner
 	jobs       []*Job
 	pending    []*Job
@@ -176,8 +186,8 @@ type JobManager struct {
 	closeOnce  sync.Once
 }
 
-func NewJobManager(root *SafeRoot, runner JobRunner) *JobManager {
-	m := &JobManager{root: root, runner: runner, reserved: make(map[string]bool), workerDone: make(chan struct{})}
+func NewJobManager(roots *RootRegistry, runner JobRunner) *JobManager {
+	m := &JobManager{roots: roots, runner: runner, reserved: make(map[string]bool), workerDone: make(chan struct{})}
 	m.cond = sync.NewCond(&m.mu)
 	go m.worker()
 	return m
@@ -209,8 +219,12 @@ func CalculatePresetMB(size int64, preset string, exact int64) (int64, string, e
 	return mb, quality, nil
 }
 
-func (m *JobManager) Submit(path, preset, container string, keepAllAudio bool, exactMB int64) (*Job, error) {
-	source, clean, err := m.root.ResolveVideo(path)
+func (m *JobManager) Submit(rootID, path, preset, container string, keepAllAudio bool, exactMB int64) (*Job, error) {
+	mediaRoot, err := m.roots.Get(rootID)
+	if err != nil {
+		return nil, ErrUnknownRoot
+	}
+	source, clean, err := mediaRoot.Root.ResolveVideo(path)
 	if err != nil {
 		return nil, ErrInvalidPath
 	}
@@ -231,7 +245,7 @@ func (m *JobManager) Submit(path, preset, container string, keepAllAudio bool, e
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, errors.New("could not inspect intended output")
 	}
-	relOutput, err := filepathRelSlash(m.root.Path(), output)
+	relOutput, err := filepathRelSlash(mediaRoot.Root.Path(), output)
 	if err != nil {
 		return nil, errors.New("invalid intended output")
 	}
@@ -251,9 +265,10 @@ func (m *JobManager) Submit(path, preset, container string, keepAllAudio bool, e
 	}
 	m.nextID++
 	job := &Job{
-		ID: strconv.FormatUint(m.nextID, 10), Path: clean, Filename: filepathBase(clean), OutputPath: relOutput,
+		ID: strconv.FormatUint(m.nextID, 10), RootID: mediaRoot.ID, RootLabel: mediaRoot.Label,
+		Path: clean, Filename: filepathBase(clean), OutputPath: relOutput,
 		OriginalSize: info.Size(), Settings: JobSettings{Preset: preset, Quality: quality, Container: container, KeepAllAudio: keepAllAudio, TargetMB: target},
-		State: StateQueued, Stage: "Waiting", QueuedAt: time.Now().UTC(), Logs: []string{},
+		State: StateQueued, Stage: "Waiting", QueuedAt: time.Now().UTC(), Logs: []string{}, outputAbs: output,
 	}
 	m.jobs = append(m.jobs, job)
 	m.pending = append(m.pending, job)
@@ -297,7 +312,7 @@ func (m *JobManager) Cancel(id string) error {
 		case StateQueued:
 			now := time.Now().UTC()
 			job.State, job.Stage, job.FinishedAt = StateCancelled, "Cancelled", &now
-			delete(m.reserved, outputPathFromJob(m.root.Path(), job))
+			delete(m.reserved, job.outputAbs)
 		case StateRunning:
 			if job.cancel != nil {
 				job.cancel()
@@ -362,13 +377,9 @@ func (m *JobManager) worker() {
 				job.SavedPercent = (1 - float64(result.Size)/float64(job.OriginalSize)) * 100
 			}
 		}
-		delete(m.reserved, outputPathFromJob(m.root.Path(), job))
+		delete(m.reserved, job.outputAbs)
 		m.mu.Unlock()
 	}
-}
-
-func outputPathFromJob(root string, job *Job) string {
-	return filepath.Join(root, filepath.FromSlash(job.OutputPath))
 }
 
 func cloneJob(job *Job, now time.Time) *Job {
