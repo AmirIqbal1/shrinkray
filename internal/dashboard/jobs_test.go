@@ -1,7 +1,11 @@
 package dashboard
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync"
@@ -92,6 +96,53 @@ func TestPresetSizeCalculations(t *testing.T) {
 		if err != nil || got != test.wantMB || quality != test.quality {
 			t.Errorf("CalculatePresetMB(%q) = %d, %q, %v; want %d, %q", test.preset, got, quality, err, test.wantMB, test.quality)
 		}
+	}
+}
+
+func TestQueuedJobLogsSerializeAsEmptyArray(t *testing.T) {
+	manager, _, dir := managerFixture(t)
+	job := submitTestJob(t, manager, dir, "movie.mkv")
+	if job.Logs == nil {
+		t.Fatal("newly queued job has a nil Logs slice")
+	}
+
+	encoded, err := json.Marshal(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(encoded, []byte(`"logs":[]`)) {
+		t.Fatalf("queued job JSON does not contain an empty logs array: %s", encoded)
+	}
+	if bytes.Contains(encoded, []byte(`"logs":null`)) {
+		t.Fatalf("queued job JSON contains null logs: %s", encoded)
+	}
+}
+
+func TestJobsEndpointSerializesEmptyQueueAsArray(t *testing.T) {
+	server, err := NewServer(t.TempDir(), "unused-shrinkray", t.TempDir(), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(server.Close)
+
+	request := httptest.NewRequest(http.MethodGet, "/api/jobs", nil)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET /api/jobs status = %d; want %d", response.Code, http.StatusOK)
+	}
+
+	var payload struct {
+		Jobs []*Job `json:"jobs"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Jobs == nil || len(payload.Jobs) != 0 {
+		t.Fatalf("GET /api/jobs returned %#v; want a non-nil empty jobs array", payload.Jobs)
+	}
+	if !bytes.Contains(response.Body.Bytes(), []byte(`"jobs":[]`)) {
+		t.Fatalf("GET /api/jobs response = %s; want jobs:[]", response.Body.Bytes())
 	}
 }
 
