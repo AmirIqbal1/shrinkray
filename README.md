@@ -23,6 +23,53 @@ shrinkray movie.mkv --size 700
 
 Direct mode creates `movie.shrunk.mkv` by default.
 
+## Server dashboard
+
+The lightweight server dashboard lets another device browse movies that are
+already on a headless server, inspect them, and queue Shrinkray jobs. It uses a
+single encoding worker so simultaneous software encodes cannot overload a small
+server. The dashboard does not upload, rename, replace, move, or delete files.
+
+Go 1.22 or newer is required to build and run the server. From a repository
+clone, test it locally with:
+
+```bash
+go run ./cmd/shrinkray-server \
+  --root ~/Videos \
+  --shrinkray-bin ./shrinkray
+```
+
+Then open <http://127.0.0.1:8787>. The server listens only on localhost by
+default.
+
+For safe access to a remote server, keep that default and open an SSH tunnel:
+
+```bash
+ssh -L 8787:127.0.0.1:8787 user@server
+```
+
+Then open <http://127.0.0.1:8787> on the local device.
+
+On a trusted LAN or Tailscale network, listen on all interfaces explicitly:
+
+```bash
+go run ./cmd/shrinkray-server \
+  --root /media/movies \
+  --listen 0.0.0.0:8787 \
+  --shrinkray-bin ./shrinkray
+```
+
+**The dashboard has no authentication. Do not expose it directly to the public
+internet. Use localhost, SSH tunnelling, a trusted LAN, Tailscale, or a
+protected reverse proxy.** Every browsed or submitted path is resolved against
+`--root`; traversal, symlink escapes, unsupported files, and existing outputs
+are rejected.
+
+Additional server flags are `--state-dir` (default
+`~/.local/share/shrinkray/server`) and `--listen` (default
+`127.0.0.1:8787`). The server version is independent of the Bash CLI and starts
+at `shrinkray-server v0.1.0`.
+
 ## Install
 
 Shrinkray supports Ubuntu Server and Linux Mint. The installer adds `ffmpeg`

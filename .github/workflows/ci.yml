@@ -17,11 +17,25 @@ jobs:
       - name: Install test dependencies
         run: sudo apt-get update && sudo apt-get install -y ffmpeg shellcheck
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+
       - name: Run ShellCheck
         run: shellcheck install.sh shrinkray tests/*.sh
 
       - name: Run smoke test
-        run: tests/smoke-test.sh
+        run: bash tests/smoke-test.sh
 
       - name: Run guided mode test
-        run: tests/guided-mode-test.sh
+        run: bash tests/guided-mode-test.sh
+
+      - name: Run Go tests
+        run: go test ./...
+
+      - name: Build server
+        run: go build ./cmd/shrinkray-server
+
+      - name: Run server smoke test
+        run: bash tests/server-smoke-test.sh

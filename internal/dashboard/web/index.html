@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Shrinkray</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">S</span><div><h1>Shrinkray</h1><p>Small movies, safely made.</p></div></div>
+    <div class="server-meta"><span class="status"><i></i><span id="server-status">Connecting</span></span><span class="root" id="movie-root">Movie root</span></div>
+  </header>
+
+  <main>
+    <div id="notice" class="notice" hidden></div>
+    <section class="workspace">
+      <article class="card browser-card">
+        <div class="section-heading"><span class="step">1</span><div><h2>Choose a movie</h2><p>Browse files already on this server.</p></div></div>
+        <nav id="breadcrumbs" class="breadcrumbs" aria-label="Current folder"></nav>
+        <div id="file-list" class="file-list" aria-live="polite"><div class="empty">Loading movies…</div></div>
+      </article>
+
+      <div class="setup-column">
+        <article class="card details-card">
+          <div class="section-heading"><span class="step">2</span><div><h2>Movie details</h2><p id="details-hint">Select a movie to inspect it.</p></div></div>
+          <div id="movie-details" class="details-placeholder">No movie selected</div>
+        </article>
+
+        <article class="card settings-card">
+          <div class="section-heading"><span class="step">3</span><div><h2>Shrink settings</h2><p>Choose the result you want.</p></div></div>
+          <form id="job-form">
+            <fieldset id="settings-fieldset" disabled>
+              <legend>Target size</legend>
+              <div class="preset-grid">
+                <label class="preset"><input type="radio" name="preset" value="balanced" checked><span><strong>Balanced</strong><small>60% · good quality</small></span></label>
+                <label class="preset"><input type="radio" name="preset" value="smaller"><span><strong>Smaller</strong><small>40% · good quality</small></span></label>
+                <label class="preset"><input type="radio" name="preset" value="better"><span><strong>Better quality</strong><small>75% · best quality</small></span></label>
+                <label class="preset exact"><input type="radio" name="preset" value="exact"><span><strong>Exact size</strong><span class="exact-input"><input id="exact-size" type="number" min="1" step="1" inputmode="numeric" placeholder="MB"><small>MB</small></span></span></label>
+              </div>
+              <div class="select-row">
+                <label>Container<select id="container"><option value="mkv">MKV</option><option value="mp4">MP4</option></select></label>
+                <label>Audio<select id="audio"><option value="first">First audio track</option><option value="all">Keep all audio tracks</option></select></label>
+              </div>
+              <div class="target-summary"><span>Calculated target</span><strong id="target-size">—</strong></div>
+              <button class="primary" type="submit">Add to queue <span aria-hidden="true">→</span></button>
+            </fieldset>
+          </form>
+        </article>
+      </div>
+    </section>
+
+    <section class="queue-section">
+      <div class="queue-heading"><div><span class="eyebrow">ENCODE QUEUE</span><h2>Jobs</h2></div><p>One movie runs at a time to keep your server responsive.</p></div>
+      <div id="jobs" class="jobs"><div class="empty queue-empty">No jobs yet. Choose a movie above to get started.</div></div>
+    </section>
+  </main>
+  <footer>SHRINKRAY SERVER <span>·</span> ORIGINAL FILES ARE NEVER REPLACED</footer>
+  <script src="/app.js" defer></script>
+</body>
+</html>
