@@ -67,6 +67,27 @@ Separate roots are safer than `--root /media`: Shrinkray can browse only the
 configured Movies and TV libraries, not unrelated folders that happen to live
 under `/media`. Configured roots must not overlap.
 
+### Systemd server installation
+
+On Ubuntu Server, Ubuntu Desktop, or Linux Mint, install the CLI, dashboard,
+managed configuration, and systemd service with:
+
+```bash
+curl -fsSL \
+  https://raw.githubusercontent.com/AmirIqbal1/shrinkray/main/install-server.sh \
+  | sudo bash -s -- \
+      --user amir \
+      --root "Movies=/media/movies" \
+      --root "TV Shows=/media/tv"
+```
+
+The managed service always listens on `127.0.0.1:8787` by default. Existing
+Tailscale Serve configuration can continue proxying private HTTPS traffic to
+that loopback endpoint. Re-running the installer updates the binaries while
+preserving the configured user, port, and roots unless replacements are
+provided explicitly. Use `--source-dir /path/to/shrinkray` to build from a
+local checkout or `--dry-run` to validate without installing system files.
+
 For safe access to a remote server, keep that default and open an SSH tunnel:
 
 ```bash
@@ -103,7 +124,7 @@ with `apt-get` when it is missing, then installs the `shrinkray` command for
 your user.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AmirIqbal1/shinkray/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/AmirIqbal1/shrinkray/main/install.sh | bash
 ```
 
 Open a new terminal after installation, then check that everything is ready:
@@ -115,15 +136,15 @@ shrinkray doctor
 To install from a clone instead:
 
 ```bash
-git clone https://github.com/AmirIqbal1/shinkray.git
-cd shinkray
+git clone https://github.com/AmirIqbal1/shrinkray.git
+cd shrinkray
 ./install.sh
 ```
 
 For a system-wide installation in `/usr/local/bin`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AmirIqbal1/shinkray/main/install.sh | bash -s -- --system
+curl -fsSL https://raw.githubusercontent.com/AmirIqbal1/shrinkray/main/install.sh | bash -s -- --system
 ```
 
 The default user installation goes to `~/.local/bin` and does not need `sudo`
