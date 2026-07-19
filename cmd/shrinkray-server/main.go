@@ -17,12 +17,21 @@ import (
 	"github.com/AmirIqbal1/shrinkray/internal/dashboard"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
+
+type rootValues []string
+
+func (values *rootValues) String() string { return strings.Join(*values, ", ") }
+func (values *rootValues) Set(value string) error {
+	*values = append(*values, value)
+	return nil
+}
 
 func main() {
-	var root, listen, shrinkrayBin, stateDir string
+	var roots rootValues
+	var listen, shrinkrayBin, stateDir string
 	var showVersion bool
-	flag.StringVar(&root, "root", "", "movie directory the dashboard may browse (required)")
+	flag.Var(&roots, "root", "media directory or Display Name=/media/directory (required, repeatable)")
 	flag.StringVar(&listen, "listen", "127.0.0.1:8787", "HTTP listen address")
 	flag.StringVar(&shrinkrayBin, "shrinkray-bin", "shrinkray", "path to the shrinkray CLI")
 	flag.StringVar(&stateDir, "state-dir", defaultStateDir(), "server state directory")
@@ -33,7 +42,7 @@ func main() {
 		fmt.Printf("shrinkray-server v%s\n", version)
 		return
 	}
-	if root == "" {
+	if len(roots) == 0 {
 		fmt.Fprintln(os.Stderr, "shrinkray-server: --root is required")
 		flag.Usage()
 		os.Exit(2)
@@ -42,7 +51,11 @@ func main() {
 		log.Fatalf("create state directory: %v", err)
 	}
 
-	srv, err := dashboard.NewServer(root, shrinkrayBin, stateDir, version)
+	registry, err := dashboard.NewRootRegistry(roots)
+	if err != nil {
+		log.Fatal(err)
+	}
+	srv, err := dashboard.NewServer(registry, shrinkrayBin, stateDir, version)
 	if err != nil {
 		log.Fatal(err)
 	}

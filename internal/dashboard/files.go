@@ -38,6 +38,8 @@ type FileList struct {
 }
 
 type MovieDetails struct {
+	RootID         string  `json:"root_id"`
+	RootLabel      string  `json:"root_label"`
 	Filename       string  `json:"filename"`
 	Path           string  `json:"path"`
 	Size           int64   `json:"size"`

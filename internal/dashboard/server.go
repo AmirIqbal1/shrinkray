@@ -17,7 +17,7 @@ const maxJSONBody = 64 << 10
 var webAssets embed.FS
 
 type Server struct {
-	root     *SafeRoot
+	roots    *RootRegistry
 	jobs     *JobManager
 	stateDir string
 	version  string
@@ -25,6 +25,7 @@ type Server struct {
 }
 
 type createJobRequest struct {
+	RootID       string `json:"root_id"`
 	Path         string `json:"path"`
 	Preset       string `json:"preset"`
 	Container    string `json:"container"`
@@ -32,13 +33,12 @@ type createJobRequest struct {
 	ExactMB      int64  `json:"exact_mb"`
 }
 
-func NewServer(rootPath, shrinkrayBin, stateDir, version string) (*Server, error) {
-	root, err := NewSafeRoot(rootPath)
-	if err != nil {
-		return nil, err
+func NewServer(roots *RootRegistry, shrinkrayBin, stateDir, version string) (*Server, error) {
+	if roots == nil || len(roots.Roots()) == 0 {
+		return nil, errors.New("at least one media root is required")
 	}
-	s := &Server{root: root, stateDir: stateDir, version: version}
-	s.jobs = NewJobManager(root, NewCLIRunner(root, shrinkrayBin))
+	s := &Server{roots: roots, stateDir: stateDir, version: version}
+	s.jobs = NewJobManager(roots, NewCLIRunner(roots, shrinkrayBin))
 	s.handler = s.routes()
 	return s, nil
 }
@@ -86,8 +86,13 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status": "ok", "version": s.version, "root": s.root.Path(),
+		"status": "ok", "version": s.version, "roots": s.roots.Summaries(),
 	})
+}
+
+func (s *Server) requestedRoot(r *http.Request) (*MediaRoot, bool) {
+	root, err := s.roots.Get(r.URL.Query().Get("root"))
+	return root, err == nil
 }
 
 func (s *Server) files(w http.ResponseWriter, r *http.Request) {
@@ -95,7 +100,12 @@ func (s *Server) files(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	list, err := s.root.List(r.URL.Query().Get("path"))
+	root, ok := s.requestedRoot(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "unknown or missing media root")
+		return
+	}
+	list, err := root.Root.List(r.URL.Query().Get("path"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid folder path")
 		return
@@ -108,7 +118,12 @@ func (s *Server) probe(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	details, err := s.root.Probe(r.URL.Query().Get("path"))
+	root, ok := s.requestedRoot(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "unknown or missing media root")
+		return
+	}
+	details, err := root.Root.Probe(r.URL.Query().Get("path"))
 	if err != nil {
 		message := "could not inspect that movie"
 		if errors.Is(err, ErrInvalidPath) {
@@ -117,6 +132,7 @@ func (s *Server) probe(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, message)
 		return
 	}
+	details.RootID, details.RootLabel = root.ID, root.Label
 	writeJSON(w, http.StatusOK, details)
 }
 
@@ -134,7 +150,7 @@ func (s *Server) jobsEndpoint(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid job request")
 			return
 		}
-		job, err := s.jobs.Submit(request.Path, request.Preset, request.Container, request.KeepAllAudio, request.ExactMB)
+		job, err := s.jobs.Submit(request.RootID, request.Path, request.Preset, request.Container, request.KeepAllAudio, request.ExactMB)
 		if err != nil {
 			status := http.StatusBadRequest
 			if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "already targets") {

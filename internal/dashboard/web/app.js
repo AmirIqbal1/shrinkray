@@ -1,6 +1,8 @@
 const state = {
   currentPath: '',
   selected: null,
+  roots: [],
+  rootID: '',
   jobs: [],
   expandedLogJobs: new Set(),
   knownLogJobs: new Set(),
@@ -58,18 +60,67 @@ function showNotice(message, kind = 'error') {
 async function loadHealth() {
   try {
     const health = await api('/api/health');
+    const roots = Array.isArray(health?.roots) ? health.roots : [];
+    state.roots = roots.filter((root) => root && typeof root.id === 'string' && root.id && typeof root.label === 'string');
+    if (!state.roots.some((root) => root.id === state.rootID)) state.rootID = state.roots[0]?.id || '';
     $('#server-status').textContent = `Online · v${health.version}`;
-    $('#movie-root').textContent = health.root;
-    $('#movie-root').title = health.root;
+    renderLibrarySelector();
+    return true;
   } catch (error) {
     $('#server-status').textContent = 'Offline';
+    state.roots = [];
+    state.rootID = '';
+    renderLibrarySelector();
     showNotice(error.message);
+    return false;
   }
 }
 
+function currentRoot() {
+  return state.roots.find((root) => root.id === state.rootID) || null;
+}
+
+function renderLibrarySelector() {
+  const selector = $('#library-selector');
+  selector.innerHTML = state.roots.map((root) => `
+    <button type="button" data-root-id="${escapeHTML(root.id)}" class="${root.id === state.rootID ? 'active' : ''}" aria-pressed="${root.id === state.rootID}">${escapeHTML(root.label)}</button>
+  `).join('');
+  const selected = currentRoot();
+  const summary = selected ? `${selected.label}${state.roots.length > 1 ? ` · ${state.roots.length} libraries` : ''}` : 'No media libraries';
+  $('#movie-root').textContent = summary;
+  $('#movie-root').title = summary;
+}
+
+function clearMovieSelection() {
+  state.selected = null;
+  $('#details-hint').textContent = 'Select a movie to inspect it.';
+  $('#movie-details').innerHTML = '<div class="details-placeholder">No movie selected</div>';
+  $('#job-form').reset();
+  $('#settings-fieldset').disabled = true;
+  $('#target-size').textContent = '—';
+  $('#exact-size').disabled = true;
+}
+
+async function switchLibrary(rootID) {
+  if (!state.roots.some((root) => root.id === rootID) || rootID === state.rootID) return;
+  state.rootID = rootID;
+  state.currentPath = '';
+  clearMovieSelection();
+  renderLibrarySelector();
+  renderBreadcrumbs();
+  $('#file-list').innerHTML = '<div class="empty">Loading movies…</div>';
+  await loadFiles('');
+}
+
 async function loadFiles(folder = '') {
+  const requestedRootID = state.rootID;
+  if (!requestedRootID) {
+    $('#file-list').innerHTML = '<div class="empty">No media library is configured.</div>';
+    return;
+  }
   try {
-    const response = await api(`/api/files?path=${encodeURIComponent(folder)}`);
+    const response = await api(`/api/files?root=${encodeURIComponent(requestedRootID)}&path=${encodeURIComponent(folder)}`);
+    if (requestedRootID !== state.rootID) return;
     const listing = response && typeof response === 'object' ? response : {};
     const entries = Array.isArray(listing.entries)
       ? listing.entries.filter((entry) => entry && typeof entry === 'object')
@@ -96,7 +147,8 @@ async function loadFiles(folder = '') {
 function renderBreadcrumbs() {
   const parts = state.currentPath ? state.currentPath.split('/') : [];
   let accumulated = '';
-  const crumbs = ['<button data-path="">Movies</button>'];
+  const rootLabel = currentRoot()?.label || 'Library';
+  const crumbs = [`<button data-path="">${escapeHTML(rootLabel)}</button>`];
   parts.forEach((part) => {
     accumulated = accumulated ? `${accumulated}/${part}` : part;
     crumbs.push(`<span>›</span><button data-path="${escapeHTML(accumulated)}">${escapeHTML(part)}</button>`);
@@ -105,14 +157,18 @@ function renderBreadcrumbs() {
 }
 
 async function selectMovie(path) {
+  const requestedRootID = state.rootID;
+  if (!requestedRootID) return;
   $('#movie-details').innerHTML = '<div class="details-placeholder">Inspecting movie…</div>';
   try {
-    state.selected = await api(`/api/probe?path=${encodeURIComponent(path)}`);
-    const movie = state.selected;
+    const movie = await api(`/api/probe?root=${encodeURIComponent(requestedRootID)}&path=${encodeURIComponent(path)}`);
+    if (requestedRootID !== state.rootID) return;
+    state.selected = movie;
     $('#details-hint').textContent = movie.filename;
     $('#movie-details').innerHTML = `
-      <div class="selected-movie"><span class="movie-icon">▶</span><div><strong>${escapeHTML(movie.filename)}</strong><small>${escapeHTML(movie.path)}</small></div></div>
+      <div class="selected-movie"><span class="movie-icon">▶</span><div><strong>${escapeHTML(movie.filename)}</strong><small>${escapeHTML(movie.root_label)} · ${escapeHTML(movie.path)}</small></div></div>
       <dl class="detail-grid">
+        <div><dt>Library</dt><dd>${escapeHTML(movie.root_label)}</dd></div>
         <div><dt>File size</dt><dd>${formatBytes(movie.size)}</dd></div>
         <div><dt>Duration</dt><dd>${formatDuration(movie.duration_seconds)}</dd></div>
         <div><dt>Resolution</dt><dd>${movie.width} × ${movie.height}</dd></div>
@@ -154,6 +210,7 @@ async function submitJob(event) {
     return;
   }
   const body = {
+    root_id: state.selected.root_id,
     path: state.selected.path,
     preset,
     container: $('#container').value,
@@ -190,6 +247,8 @@ function normalizeJob(job) {
     state: typeof job.state === 'string' ? job.state : 'unknown',
     stage: typeof job.stage === 'string' ? job.stage : 'Unknown stage',
     failure: typeof job.failure === 'string' ? job.failure : '',
+    root_id: typeof job.root_id === 'string' ? job.root_id : '',
+    root_label: typeof job.root_label === 'string' ? job.root_label : 'Unknown library',
     queued_at: job.queued_at,
     elapsed_seconds: numberOrZero(job.elapsed_seconds),
     result_size: numberOrZero(job.result_size),
@@ -252,7 +311,7 @@ function renderJobs() {
       <div class="job-main">
         <div class="job-state-icon">${active ? '<i class="spinner"></i>' : job.state === 'completed' ? '✓' : job.state === 'failed' ? '!' : job.state === 'cancelled' ? '×' : '…'}</div>
         <div class="job-copy"><div class="job-title"><strong>${escapeHTML(job.filename)}</strong><span class="state-pill">${escapeHTML(job.state)}</span></div>
-          <p>${job.settings.target_mb.toLocaleString()} MB target · ${escapeHTML(jobSettings(job))} · queued ${escapeHTML(formatQueued(job.queued_at))}</p>
+          <p>${escapeHTML(job.root_label)} · ${job.settings.target_mb.toLocaleString()} MB target · ${escapeHTML(jobSettings(job))} · queued ${escapeHTML(formatQueued(job.queued_at))}</p>
           <div class="stage"><span>${escapeHTML(job.stage)}</span><small>${formatElapsed(job.elapsed_seconds)}</small></div>
           ${failure}${logs}
         </div>
@@ -293,6 +352,10 @@ $('#breadcrumbs').addEventListener('click', (event) => {
   const crumb = event.target.closest('button');
   if (crumb) loadFiles(crumb.dataset.path);
 });
+$('#library-selector').addEventListener('click', (event) => {
+  const button = event.target.closest('[data-root-id]');
+  if (button) switchLibrary(button.dataset.rootId);
+});
 $('#job-form').addEventListener('submit', submitJob);
 document.querySelectorAll('input[name="preset"]').forEach((input) => input.addEventListener('change', updateTarget));
 $('#exact-size').addEventListener('input', updateTarget);
@@ -309,7 +372,11 @@ $('#jobs').addEventListener('toggle', (event) => {
   else state.expandedLogJobs.delete(id);
 }, true);
 
-loadHealth();
-loadFiles();
-loadJobs();
-setInterval(loadJobs, 2000);
+async function initialize() {
+  await loadHealth();
+  await loadFiles();
+  await loadJobs();
+  setInterval(loadJobs, 2000);
+}
+
+initialize();
