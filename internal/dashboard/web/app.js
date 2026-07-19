@@ -1,4 +1,10 @@
-const state = { currentPath: '', selected: null, jobs: [] };
+const state = {
+  currentPath: '',
+  selected: null,
+  jobs: [],
+  expandedLogJobs: new Set(),
+  knownLogJobs: new Set(),
+};
 const $ = (selector) => document.querySelector(selector);
 
 function formatBytes(bytes) {
@@ -63,15 +69,19 @@ async function loadHealth() {
 
 async function loadFiles(folder = '') {
   try {
-    const listing = await api(`/api/files?path=${encodeURIComponent(folder)}`);
-    state.currentPath = listing.path;
+    const response = await api(`/api/files?path=${encodeURIComponent(folder)}`);
+    const listing = response && typeof response === 'object' ? response : {};
+    const entries = Array.isArray(listing.entries)
+      ? listing.entries.filter((entry) => entry && typeof entry === 'object')
+      : [];
+    state.currentPath = typeof listing.path === 'string' ? listing.path : '';
     renderBreadcrumbs();
     const list = $('#file-list');
-    if (!listing.entries.length) {
+    if (!entries.length) {
       list.innerHTML = '<div class="empty">No supported movies or folders here.</div>';
       return;
     }
-    list.innerHTML = listing.entries.map((entry) => `
+    list.innerHTML = entries.map((entry) => `
       <button class="file-row ${entry.type}" data-path="${escapeHTML(entry.path)}" data-type="${entry.type}">
         <span class="file-icon" aria-hidden="true">${entry.type === 'directory' ? '⌑' : '▶'}</span>
         <span class="file-name">${escapeHTML(entry.name)}</span>
@@ -162,11 +172,61 @@ async function submitJob(event) {
 
 function jobSettings(job) {
   const labels = { balanced: 'Balanced', smaller: 'Smaller', better: 'Better quality', exact: 'Exact size' };
-  return `${labels[job.settings.preset]} · ${job.settings.quality} · ${job.settings.container.toUpperCase()} · ${job.settings.keep_all_audio ? 'all audio' : 'first audio'}`;
+  const preset = labels[job.settings.preset] || 'Custom';
+  const container = String(job.settings.container || 'mkv').toUpperCase();
+  return `${preset} · ${job.settings.quality || 'good'} · ${container} · ${job.settings.keep_all_audio ? 'all audio' : 'first audio'}`;
+}
+
+function normalizeJob(job) {
+  if (!job || typeof job !== 'object' || !['string', 'number'].includes(typeof job.id)) return null;
+  const id = String(job.id);
+  if (!id) return null;
+  const settings = job.settings && typeof job.settings === 'object' ? job.settings : {};
+  const numberOrZero = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
+  return {
+    ...job,
+    id,
+    filename: typeof job.filename === 'string' ? job.filename : 'Unknown job',
+    state: typeof job.state === 'string' ? job.state : 'unknown',
+    stage: typeof job.stage === 'string' ? job.stage : 'Unknown stage',
+    failure: typeof job.failure === 'string' ? job.failure : '',
+    queued_at: job.queued_at,
+    elapsed_seconds: numberOrZero(job.elapsed_seconds),
+    result_size: numberOrZero(job.result_size),
+    saved_percent: numberOrZero(job.saved_percent),
+    logs: Array.isArray(job.logs) ? job.logs : [],
+    settings: {
+      preset: typeof settings.preset === 'string' ? settings.preset : 'balanced',
+      quality: typeof settings.quality === 'string' ? settings.quality : 'good',
+      container: typeof settings.container === 'string' ? settings.container : 'mkv',
+      keep_all_audio: settings.keep_all_audio === true,
+      target_mb: numberOrZero(settings.target_mb),
+    },
+  };
+}
+
+function rememberLogPanelState(container) {
+  container.querySelectorAll('details[data-job-logs]').forEach((details) => {
+    const id = details.dataset.jobLogs;
+    state.knownLogJobs.add(id);
+    if (details.open) state.expandedLogJobs.add(id);
+    else state.expandedLogJobs.delete(id);
+  });
+}
+
+function pruneLogPanelState() {
+  const currentJobIDs = new Set(state.jobs.map((job) => job.id));
+  [state.expandedLogJobs, state.knownLogJobs].forEach((storedIDs) => {
+    storedIDs.forEach((id) => {
+      if (!currentJobIDs.has(id)) storedIDs.delete(id);
+    });
+  });
 }
 
 function renderJobs() {
   const container = $('#jobs');
+  rememberLogPanelState(container);
+  pruneLogPanelState();
   if (!state.jobs.length) {
     container.innerHTML = '<div class="empty queue-empty">No jobs yet. Choose a movie above to get started.</div>';
     return;
@@ -178,7 +238,16 @@ function renderJobs() {
       ? `<div class="result"><strong>${formatBytes(job.result_size)}</strong><span>${job.saved_percent >= 0 ? `${job.saved_percent.toFixed(1)}% saved` : 'output is larger'}</span></div>`
       : '';
     const failure = job.failure ? `<p class="failure">${escapeHTML(job.failure)}</p>` : '';
-    const logs = job.logs.length ? `<details ${active ? 'open' : ''}><summary>Latest log messages</summary><pre>${job.logs.map(escapeHTML).join('\n')}</pre></details>` : '';
+    const logLines = Array.isArray(job.logs) ? job.logs : [];
+    const hasStoredLogState = state.knownLogJobs.has(job.id);
+    const logsOpen = hasStoredLogState ? state.expandedLogJobs.has(job.id) : active;
+    if (logLines.length) {
+      state.knownLogJobs.add(job.id);
+      if (logsOpen) state.expandedLogJobs.add(job.id);
+    }
+    const logs = logLines.length
+      ? `<details data-job-logs="${escapeHTML(job.id)}" ${logsOpen ? 'open' : ''}><summary>Latest log messages</summary><pre>${logLines.map(escapeHTML).join('\n')}</pre></details>`
+      : '';
     return `<article class="job ${job.state}">
       <div class="job-main">
         <div class="job-state-icon">${active ? '<i class="spinner"></i>' : job.state === 'completed' ? '✓' : job.state === 'failed' ? '!' : job.state === 'cancelled' ? '×' : '…'}</div>
@@ -197,7 +266,8 @@ function renderJobs() {
 async function loadJobs() {
   try {
     const data = await api('/api/jobs');
-    state.jobs = data.jobs;
+    const jobs = Array.isArray(data?.jobs) ? data.jobs : [];
+    state.jobs = jobs.map(normalizeJob).filter((job) => job !== null);
     renderJobs();
   } catch (error) {
     showNotice(error.message);
@@ -230,6 +300,14 @@ $('#jobs').addEventListener('click', (event) => {
   const button = event.target.closest('[data-cancel]');
   if (button) cancelJob(button.dataset.cancel);
 });
+$('#jobs').addEventListener('toggle', (event) => {
+  const details = event.target.closest('details[data-job-logs]');
+  if (!details) return;
+  const id = details.dataset.jobLogs;
+  state.knownLogJobs.add(id);
+  if (details.open) state.expandedLogJobs.add(id);
+  else state.expandedLogJobs.delete(id);
+}, true);
 
 loadHealth();
 loadFiles();

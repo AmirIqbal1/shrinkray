@@ -374,7 +374,7 @@ func outputPathFromJob(root string, job *Job) string {
 func cloneJob(job *Job, now time.Time) *Job {
 	copy := *job
 	copy.cancel = nil
-	copy.Logs = append([]string(nil), job.Logs...)
+	copy.Logs = append(make([]string, 0, len(job.Logs)), job.Logs...)
 	if job.StartedAt != nil {
 		end := now
 		if job.FinishedAt != nil {
