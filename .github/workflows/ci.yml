@@ -18,7 +18,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg shellcheck
 
       - name: Run ShellCheck
-        run: shellcheck install.sh shrinkray tests/smoke-test.sh
+        run: shellcheck install.sh shrinkray tests/*.sh
 
       - name: Run smoke test
         run: tests/smoke-test.sh
+
+      - name: Run guided mode test
+        run: tests/guided-mode-test.sh
