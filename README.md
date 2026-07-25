@@ -105,11 +105,8 @@ Shrinkray private browser URL:
 https://hostname.tailnet.ts.net:8443/
 ```
 
-For Amir's current server, the private dashboard URL is:
-
-```text
-https://home-server.tailb4ae63.ts.net:8443/
-```
+The installer prints the server's private Tailscale dashboard URL after setup.
+Do not publish private tailnet hostnames in a public repository.
 
 Port `443` remains reserved for Coolify, Traefik, Caddy, Nginx, Apache, or
 another host reverse proxy. Port `8443` is the private Tailscale HTTPS listener,
