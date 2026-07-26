@@ -4,3 +4,4 @@
 *.part
 x265_2pass.log*
 .DS_Store
+.env

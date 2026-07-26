@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+command_name="$(basename -- "$0")"
+{
+  printf '%s' "$command_name"
+  printf ' %q' "$@"
+  printf '\n'
+} >>"$TEST_LOG"
+
+state_dir="${TEST_STATE_DIR:?}"
+
+case "$command_name" in
+  docker)
+    case "${1-} ${2-}" in
+      "compose ps")
+        if [ "${TEST_CONTAINER_EXISTS:-1}" = 1 ]; then
+          printf 'test-container-id\n'
+        fi
+        ;;
+      "compose version") printf 'Docker Compose test\n' ;;
+      "compose config") printf 'services: {}\n' ;;
+      "compose restart") touch "${state_dir}/restarted" ;;
+      "compose up")
+        [ "${TEST_START_STAYS_UNHEALTHY:-0}" = 1 ] ||
+          touch "${state_dir}/started"
+        ;;
+      "info ") printf 'test Docker daemon\n' ;;
+      "inspect --format"*)
+        format="${3-}"
+        case "$format" in
+          *'.State.Running'*)
+            if [ -f "${state_dir}/restarted" ] || [ -f "${state_dir}/started" ]; then
+              printf 'true\n'
+            else
+              printf '%s\n' "${TEST_CONTAINER_RUNNING:-true}"
+            fi
+            ;;
+          *'.State.Health'*)
+            if [ -f "${state_dir}/restarted" ] || [ -f "${state_dir}/started" ]; then
+              printf 'healthy\n'
+            else
+              printf '%s\n' "${TEST_CONTAINER_HEALTH:-healthy}"
+            fi
+            ;;
+          *'.Mounts'*)
+            printf '/media/movies\n/media/tv\n/var/lib/shrinkray\n'
+            ;;
+          *'.Config.User'*) printf '1000:1000\n' ;;
+          *'.Config.Image'*) printf 'shrinkray-shrinkray\n' ;;
+          *'.Image'*) printf 'sha256:old-image\n' ;;
+        esac
+        ;;
+    esac
+    ;;
+  curl)
+    if { [ -f "${state_dir}/restarted" ] || [ -f "${state_dir}/started" ]; } &&
+      [ "${TEST_START_STAYS_UNHEALTHY:-0}" != 1 ] ||
+      [ -f "${state_dir}/native-restarted" ] || [ "${TEST_HEALTH_OK:-1}" = 1 ]; then
+      printf '{"status":"ok"}\n'
+    else
+      exit 22
+    fi
+    ;;
+  tailscale)
+    case "${1-} ${2-}" in
+      "status --json")
+        printf '{"BackendState":"Running","Self":{"DNSName":"hostname.tailnet.ts.net."}}\n'
+        ;;
+      "status ") printf 'Tailscale test status\n' ;;
+      "serve status")
+        if [ -f "${state_dir}/tailscale-configured" ]; then
+          printf 'https://hostname.tailnet.ts.net:8443/\n'
+          printf '|-- / proxy http://127.0.0.1:8787\n\n'
+        fi
+        printf '%s\n' "${TEST_SERVE_STATUS:-No serve config}"
+        ;;
+      serve\ --https=8443*)
+        touch "${state_dir}/tailscale-configured"
+        ;;
+      serve\ --https=443*)
+        touch "${state_dir}/port-443-changed"
+        ;;
+    esac
+    ;;
+  ss)
+    printf '%s\n' "${TEST_SS_STATUS:-LISTEN 0 4096 127.0.0.1:8787 0.0.0.0:* users:((\"docker-proxy\",pid=10,fd=4))}"
+    ;;
+  systemctl)
+    case "${1-} ${2-}" in
+      "is-active --quiet")
+        [ "${TEST_SERVICE_ACTIVE:-1}" = 1 ]
+        ;;
+      "restart shrinkray.service") touch "${state_dir}/native-restarted" ;;
+    esac
+    ;;
+  git|sleep)
+    ;;
+  *)
+    printf 'unexpected fake command: %s\n' "$command_name" >&2
+    exit 1
+    ;;
+esac
