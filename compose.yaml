@@ -1,0 +1,47 @@
+services:
+  shrinkray:
+    build:
+      context: .
+    container_name: shrinkray
+    restart: unless-stopped
+    init: true
+    user: "${SHRINKRAY_UID}:${SHRINKRAY_GID}"
+    group_add:
+      - "${SHRINKRAY_MEDIA_GID}"
+    command:
+      - --root
+      - Movies=/media/movies
+      - --root
+      - TV Shows=/media/tv
+      - --listen
+      - 0.0.0.0:8787
+      - --shrinkray-bin
+      - /usr/local/bin/shrinkray
+      - --state-dir
+      - /var/lib/shrinkray
+    ports:
+      - "127.0.0.1:${SHRINKRAY_PORT:-8787}:8787"
+    volumes:
+      - "${SHRINKRAY_STATE_DIR:-/var/lib/shrinkray}:/var/lib/shrinkray"
+      - "${SHRINKRAY_MOVIES_PATH:-/media/movies}:/media/movies"
+      - "${SHRINKRAY_TV_PATH:-/media/tv}:/media/tv"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - --silent
+        - --show-error
+        - http://127.0.0.1:8787/api/health
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3

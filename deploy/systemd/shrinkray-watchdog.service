@@ -1,0 +1,12 @@
+[Unit]
+Description=Shrinkray Docker health and private-route watchdog
+After=docker.service tailscaled.service
+Wants=docker.service tailscaled.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/shrinkray
+ExecStart=/opt/shrinkray/scripts/shrinkray-watchdog.sh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict

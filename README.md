@@ -155,6 +155,114 @@ Additional server flags are `--state-dir` (default
 `127.0.0.1:8787`). The server version is independent of the Bash CLI; this
 multi-library release is `shrinkray-server v0.2.0`.
 
+### Docker home-server deployment
+
+Docker is the recommended way to run the dashboard on a home server. Tailscale
+stays installed directly on the host; it is not installed or run in the
+Shrinkray container. Copy the example settings and adjust the IDs and host
+paths:
+
+```bash
+cp .env.example .env
+id -u
+id -g
+editor .env
+mkdir -p /path/to/shrinkray-state /path/to/movies /path/to/tv
+```
+
+The configured user and media group must already be able to traverse, read, and
+write all three host directories. Media mounts are intentionally writable
+because compressed files are created beside their sources. The state and media
+directories are bind-mounted, so they survive image rebuilds and container
+recreation.
+
+Manage the deployment from the repository:
+
+```bash
+scripts/shrinkray-docker.sh start
+scripts/shrinkray-docker.sh status
+scripts/shrinkray-docker.sh logs
+scripts/shrinkray-docker.sh restart
+scripts/shrinkray-docker.sh stop
+```
+
+`build` pulls current base images and builds Shrinkray. `update` runs
+`git pull --ff-only`, builds a new image, recreates only the `shrinkray`
+service, and verifies container and API health. If validation fails, it retags
+the saved previous image and recreates the previous Shrinkray container
+configuration. It never updates or restarts unrelated containers.
+
+Use the read-only diagnostic command before repair:
+
+```bash
+scripts/shrinkray-docker.sh doctor
+sudo scripts/shrinkray-docker.sh repair
+```
+
+Doctor inspects Docker, mounts, configured IDs and permissions, local health,
+ports, Tailscale, and Serve routes. Repair may start or restart only Shrinkray,
+restore only its configured private Serve listener, and remove a legacy port
+443 listener only if it consists of exactly one route to Shrinkray. It does not
+restart Docker, Coolify, Jellyfin, reset Tailscale Serve, use Funnel, or change
+media ownership.
+
+The safe port layout is:
+
+```text
+Coolify / public reverse proxy: host port 443
+Tailscale Serve:               host private HTTPS port 8443
+Shrinkray Docker publication:  host 127.0.0.1:8787
+Shrinkray inside container:     0.0.0.0:8787
+```
+
+Docker never publishes ports 443 or 8443. The dashboard has no authentication,
+so keep port 8787 loopback-only. Configure the host-side private listener after
+the local health check passes:
+
+```bash
+sudo scripts/configure-tailscale.sh
+```
+
+The script refuses port 443, preserves unrelated Serve routes, and prints the
+private URL using the current DNS name returned by `tailscale status --json`.
+It never contains a server-specific hostname.
+
+To migrate an existing native systemd installation, first prepare and validate
+`.env`, then run:
+
+```bash
+sudo scripts/migrate-systemd-to-docker.sh
+```
+
+Migration backs up the native unit, configuration, CLI, server, and doctor
+binary under `/var/backups/shrinkray-migration/`. It builds the image before
+stopping `shrinkray.service`, starts and verifies Docker, configures private
+HTTPS, and disables only `shrinkray.service` after all health checks pass. On
+failure after the native service is stopped, it stops only the failed
+Shrinkray container, restores the backups, reloads systemd, restarts the old
+service, and verifies its previous local endpoint. It does not alter port 443,
+other services, media, state, or unrelated Docker data.
+
+An optional watchdog can check the container and private route every five
+minutes. The repository does not enable it automatically. The supplied unit
+assumes the repository is installed at `/opt/shrinkray`; edit both paths if it
+is elsewhere:
+
+```bash
+sudo install -m 0644 deploy/systemd/shrinkray-watchdog.service \
+  /etc/systemd/system/shrinkray-watchdog.service
+sudo install -m 0644 deploy/systemd/shrinkray-watchdog.timer \
+  /etc/systemd/system/shrinkray-watchdog.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now shrinkray-watchdog.timer
+```
+
+The watchdog checks for the container, verifies running state, container
+health, and local API health, then restarts only Shrinkray if needed. It
+restores only the configured port-8443 Serve route when missing and never
+changes port 443 or unrelated Serve routes. Disable it with
+`sudo systemctl disable --now shrinkray-watchdog.timer`.
+
 ## Install
 
 Shrinkray supports Ubuntu Server and Linux Mint. The installer adds `ffmpeg`
