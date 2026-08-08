@@ -128,4 +128,60 @@ printf '%s\n' "$JOB_JSON" |
   grep -Eq '"disk_required_bytes"[[:space:]]*:[[:space:]]*[1-9]' ||
   fail "bind-mounted job did not report a disk requirement: ${JOB_JSON}"
 
+PERSISTED_JOB_JSON=""
+for ((attempt = 1; attempt <= 60; attempt++)); do
+  PERSISTED_JOB_JSON="$(curl --fail --silent --show-error "http://127.0.0.1:${HOST_PORT}/api/jobs" 2>/dev/null || true)"
+  if [[ "$PERSISTED_JOB_JSON" == *'"filename":"bind-space.mkv"'* ]] && [[ "$PERSISTED_JOB_JSON" == *'"state":"failed"'* ]]; then
+    break
+  fi
+  sleep 0.1
+done
+if [[ "$PERSISTED_JOB_JSON" != *'"filename":"bind-space.mkv"'* ]] || [[ "$PERSISTED_JOB_JSON" != *'"state":"failed"'* ]]; then
+  fail "job did not reach persisted terminal history: ${PERSISTED_JOB_JSON}"
+fi
+[ -s "${STATE_DIR}/jobs.json" ] || fail 'jobs.json was not persisted through the state bind mount'
+
+printf 'Recreating container with the same state mount...\n'
+docker rm --force "$CONTAINER_NAME" >/dev/null
+docker run --detach \
+  --name "$CONTAINER_NAME" \
+  --init \
+  --user "${CURRENT_UID}:${CURRENT_GID}" \
+  --group-add "$CURRENT_GID" \
+  --read-only \
+  --tmpfs /tmp \
+  --security-opt no-new-privileges:true \
+  --cap-drop ALL \
+  --publish "127.0.0.1::8787" \
+  --mount "type=bind,src=${MOVIES_DIR},dst=/media/movies" \
+  --mount "type=bind,src=${TV_DIR},dst=/media/tv" \
+  --mount "type=bind,src=${STATE_DIR},dst=/var/lib/shrinkray" \
+  "$IMAGE_NAME" \
+  --root "Movies=/media/movies" \
+  --root "TV Shows=/media/tv" \
+  --listen "0.0.0.0:8787" \
+  --shrinkray-bin "/usr/local/bin/shrinkray" \
+  --state-dir "/var/lib/shrinkray" >/dev/null
+
+PORT_OUTPUT="$(docker port "$CONTAINER_NAME" 8787/tcp)"
+case "$PORT_OUTPUT" in
+  127.0.0.1:*) ;;
+  *) fail "unexpected recreated published port: ${PORT_OUTPUT}" ;;
+esac
+HOST_PORT="${PORT_OUTPUT##*:}"
+RECOVERED_JOBS=""
+for ((attempt = 1; attempt <= 60; attempt++)); do
+  if RECOVERED_JOBS="$(curl --fail --silent --show-error "http://127.0.0.1:${HOST_PORT}/api/jobs" 2>/dev/null)"; then
+    break
+  fi
+  if [ "$(docker inspect --format '{{.State.Running}}' "$CONTAINER_NAME")" != "true" ]; then
+    docker logs "$CONTAINER_NAME" >&2 || true
+    fail 'recreated container stopped before becoming healthy'
+  fi
+  sleep 0.1
+done
+if [[ "$RECOVERED_JOBS" != *'"filename":"bind-space.mkv"'* ]] || [[ "$RECOVERED_JOBS" != *'"state":"failed"'* ]]; then
+  fail "container recreation did not retain job history: ${RECOVERED_JOBS}"
+fi
+
 printf 'Docker smoke test passed on 127.0.0.1:%s.\n' "$HOST_PORT"

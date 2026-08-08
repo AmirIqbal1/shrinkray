@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"os/exec"
@@ -65,8 +66,9 @@ type Job struct {
 	SavedPercent         float64     `json:"saved_percent,omitempty"`
 	Failure              string      `json:"failure,omitempty"`
 
-	cancel    context.CancelFunc
-	outputAbs string
+	cancel              context.CancelFunc
+	outputAbs           string
+	lastProgressPersist time.Time
 }
 
 type RunResult struct {
@@ -284,18 +286,20 @@ func stageFromLog(line string) string {
 }
 
 type JobManager struct {
-	mu         sync.Mutex
-	cond       *sync.Cond
-	roots      *RootRegistry
-	runner     JobRunner
-	diskSpace  DiskSpaceChecker
-	jobs       []*Job
-	pending    []*Job
-	reserved   map[string]bool
-	closed     bool
-	nextID     uint64
-	workerDone chan struct{}
-	closeOnce  sync.Once
+	mu                  sync.Mutex
+	cond                *sync.Cond
+	roots               *RootRegistry
+	runner              JobRunner
+	diskSpace           DiskSpaceChecker
+	store               *jobStateStore
+	jobs                []*Job
+	pending             []*Job
+	reserved            map[string]bool
+	closed              bool
+	nextID              uint64
+	persistenceRevision uint64
+	workerDone          chan struct{}
+	closeOnce           sync.Once
 }
 
 func NewJobManager(roots *RootRegistry, runner JobRunner) *JobManager {
@@ -307,6 +311,24 @@ func newJobManagerWithDiskSpace(roots *RootRegistry, runner JobRunner, checker D
 	m.cond = sync.NewCond(&m.mu)
 	go m.worker()
 	return m
+}
+
+func newPersistentJobManager(roots *RootRegistry, runner JobRunner, checker DiskSpaceChecker, stateDir string) (*JobManager, error) {
+	store := newJobStateStore(stateDir)
+	state, err := store.Load()
+	if err != nil {
+		return nil, err
+	}
+	m := &JobManager{roots: roots, runner: runner, diskSpace: checker, store: store, reserved: make(map[string]bool), workerDone: make(chan struct{})}
+	m.cond = sync.NewCond(&m.mu)
+	if m.restore(state) {
+		m.markPersistenceDirtyLocked()
+		if err := store.Save(m.persistenceSnapshotLocked()); err != nil {
+			log.Printf("ERROR: could not persist recovered job history: %v", err)
+		}
+	}
+	go m.worker()
+	return m, nil
 }
 
 func CalculatePresetMB(size int64, preset string, exact int64) (int64, string, error) {
@@ -371,17 +393,24 @@ func (m *JobManager) Submit(rootID, path, preset, container string, keepAllAudio
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.closed {
+		m.mu.Unlock()
 		return nil, errors.New("job queue is shutting down")
 	}
 	if m.reserved[output] {
+		m.mu.Unlock()
 		return nil, errors.New("a job already targets that output")
 	}
 	if _, err := os.Lstat(output); err == nil {
+		m.mu.Unlock()
 		return nil, errors.New("intended output already exists")
 	} else if !errors.Is(err, os.ErrNotExist) {
+		m.mu.Unlock()
 		return nil, errors.New("could not inspect intended output")
+	}
+	if m.nextID == math.MaxUint64 {
+		m.mu.Unlock()
+		return nil, errors.New("job ID space is exhausted")
 	}
 	m.nextID++
 	job := &Job{
@@ -393,10 +422,22 @@ func (m *JobManager) Submit(rootID, path, preset, container string, keepAllAudio
 		DiskSafetyReserve: initialDisk.ReserveBytes, DiskSpaceWarning: initialDisk.Warning,
 	}
 	m.jobs = append(m.jobs, job)
-	m.pending = append(m.pending, job)
 	m.reserved[output] = true
+	m.markPersistenceDirtyLocked()
+	if m.store != nil {
+		if err := m.store.Save(m.persistenceSnapshotLocked()); err != nil {
+			m.jobs = m.jobs[:len(m.jobs)-1]
+			delete(m.reserved, output)
+			m.mu.Unlock()
+			log.Printf("ERROR: could not persist submitted job: %v", err)
+			return nil, fmt.Errorf("could not persist the submitted job: %w", ErrJobPersistence)
+		}
+	}
+	m.pending = append(m.pending, job)
 	m.cond.Signal()
-	return cloneJob(job, time.Now()), nil
+	result := cloneJob(job, time.Now())
+	m.mu.Unlock()
+	return result, nil
 }
 
 func filepathRelSlash(base, target string) (string, error) {
@@ -425,7 +466,6 @@ func (m *JobManager) List() []*Job {
 
 func (m *JobManager) Cancel(id string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	for _, job := range m.jobs {
 		if job.ID != id {
 			continue
@@ -435,16 +475,72 @@ func (m *JobManager) Cancel(id string) error {
 			now := time.Now().UTC()
 			job.State, job.Stage, job.FinishedAt = StateCancelled, "Cancelled", &now
 			delete(m.reserved, job.outputAbs)
+			m.removePendingLocked(job)
+			pruneTerminalHistory(&m.jobs)
+			m.markPersistenceDirtyLocked()
+			snapshot := m.persistenceSnapshotLocked()
+			m.mu.Unlock()
+			if m.store != nil {
+				if err := m.store.Save(snapshot); err != nil {
+					log.Printf("ERROR: could not persist queued job cancellation: %v", err)
+					return fmt.Errorf("job was cancelled, but its history could not be persisted: %w", ErrJobPersistence)
+				}
+			}
+			return nil
 		case StateRunning:
 			if job.cancel != nil {
 				job.cancel()
 			}
+			m.mu.Unlock()
+			return nil
 		default:
+			m.mu.Unlock()
 			return errors.New("job can no longer be cancelled")
 		}
-		return nil
 	}
+	m.mu.Unlock()
 	return errors.New("job not found")
+}
+
+func (m *JobManager) removePendingLocked(target *Job) {
+	for index, job := range m.pending {
+		if job == target {
+			m.pending = append(m.pending[:index], m.pending[index+1:]...)
+			return
+		}
+	}
+}
+
+func (m *JobManager) ClearHistory() (int, error) {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return 0, errors.New("job queue is shutting down")
+	}
+	kept := make([]*Job, 0, len(m.jobs))
+	removed := 0
+	for _, job := range m.jobs {
+		if isTerminalState(job.State) {
+			removed++
+			continue
+		}
+		kept = append(kept, job)
+	}
+	if removed == 0 {
+		m.mu.Unlock()
+		return 0, nil
+	}
+	m.jobs = kept
+	m.markPersistenceDirtyLocked()
+	snapshot := m.persistenceSnapshotLocked()
+	m.mu.Unlock()
+	if m.store != nil {
+		if err := m.store.Save(snapshot); err != nil {
+			log.Printf("ERROR: could not persist cleared job history: %v", err)
+			return removed, fmt.Errorf("history was cleared in memory, but the change could not be persisted: %w", ErrJobPersistence)
+		}
+	}
+	return removed, nil
 }
 
 func (m *JobManager) worker() {
@@ -467,15 +563,45 @@ func (m *JobManager) worker() {
 		ctx, cancel := context.WithCancel(context.Background())
 		now := time.Now().UTC()
 		job.State, job.Stage, job.StartedAt, job.cancel = StateRunning, "Inspecting", &now, cancel
+		job.FinishedAt = nil
+		job.lastProgressPersist = now
+		m.markPersistenceDirtyLocked()
+		startSnapshot := m.persistenceSnapshotLocked()
 		m.mu.Unlock()
+		if m.store != nil {
+			if err := m.store.Save(startSnapshot); err != nil {
+				log.Printf("ERROR: could not persist running job transition: %v", err)
+				cancel()
+				m.mu.Lock()
+				finished := time.Now().UTC()
+				job.State, job.Stage, job.Failure, job.FinishedAt, job.cancel = StateFailed, "Persistence error", "Shrinkray could not safely record that this job started, so the encode was not launched.", &finished, nil
+				delete(m.reserved, job.outputAbs)
+				pruneTerminalHistory(&m.jobs)
+				m.markPersistenceDirtyLocked()
+				m.mu.Unlock()
+				m.persistBestEffort("recording a persistence failure", 2)
+				continue
+			}
+		}
 
 		result, err := m.runner.Run(ctx, cloneJob(job, time.Now()), func(stage string) {
+			persist := false
 			m.mu.Lock()
 			if job.State == StateRunning {
+				previous := job.Stage
 				updateJobStage(job, stage)
+				if previous != job.Stage {
+					job.lastProgressPersist = time.Now()
+					m.markPersistenceDirtyLocked()
+					persist = true
+				}
 			}
 			m.mu.Unlock()
+			if persist {
+				m.persistBestEffort("a stage change", 0)
+			}
 		}, func(update ProgressUpdate) {
+			persist := false
 			m.mu.Lock()
 			if job.State == StateRunning {
 				job.ProgressPercent = update.ProgressPercent
@@ -485,29 +611,65 @@ func (m *JobManager) worker() {
 				job.ETASeconds = update.ETASeconds
 				job.EncodeSpeed = update.EncodeSpeed
 				job.ETAIsEstimate = update.ETAIsEstimate
+				now := time.Now()
+				if now.Sub(job.lastProgressPersist) >= progressPersistInterval {
+					job.lastProgressPersist = now
+					m.markPersistenceDirtyLocked()
+					persist = true
+				}
 			}
 			m.mu.Unlock()
+			if persist {
+				m.persistBestEffort("a progress checkpoint", 0)
+			}
 		}, func(update DiskSpaceUpdate) {
+			persist := false
 			m.mu.Lock()
 			if job.State == StateRunning {
 				job.DiskAvailableBytes = update.AvailableBytes
 				job.DiskRequiredBytes = update.RequiredBytes
 				job.DiskSafetyReserve = update.ReserveBytes
 				job.DiskSpaceWarning = update.Warning
+				now := time.Now()
+				if now.Sub(job.lastProgressPersist) >= progressPersistInterval {
+					job.lastProgressPersist = now
+					m.markPersistenceDirtyLocked()
+					persist = true
+				}
 			}
 			m.mu.Unlock()
+			if persist {
+				m.persistBestEffort("a disk-space checkpoint", 0)
+			}
 		}, func(line string) {
+			persist := false
 			m.mu.Lock()
 			job.Logs = append(job.Logs, line)
 			if len(job.Logs) > 30 {
 				job.Logs = append([]string(nil), job.Logs[len(job.Logs)-30:]...)
 			}
+			now := time.Now()
+			if job.State == StateRunning && now.Sub(job.lastProgressPersist) >= progressPersistInterval {
+				job.lastProgressPersist = now
+				m.markPersistenceDirtyLocked()
+				persist = true
+			}
 			m.mu.Unlock()
+			if persist {
+				m.persistBestEffort("a log checkpoint", 0)
+			}
 		})
 		wasCancelled := ctx.Err() != nil
 		cancel()
 
 		m.mu.Lock()
+		if m.closed {
+			job.cancel = nil
+			m.markPersistenceDirtyLocked()
+			m.mu.Unlock()
+			m.persistBestEffort("shutdown", 2)
+			continue
+		}
 		finished := time.Now().UTC()
 		job.FinishedAt, job.cancel = &finished, nil
 		if errors.Is(err, context.Canceled) || wasCancelled {
@@ -532,7 +694,10 @@ func (m *JobManager) worker() {
 			}
 		}
 		delete(m.reserved, job.outputAbs)
+		pruneTerminalHistory(&m.jobs)
+		m.markPersistenceDirtyLocked()
 		m.mu.Unlock()
+		m.persistBestEffort("a terminal job transition", 2)
 	}
 }
 
@@ -583,20 +748,22 @@ func (m *JobManager) Close() {
 	m.closeOnce.Do(func() {
 		m.mu.Lock()
 		m.closed = true
-		now := time.Now().UTC()
 		for _, job := range m.jobs {
-			switch job.State {
-			case StateQueued:
-				job.State, job.Stage, job.FinishedAt = StateCancelled, "Cancelled", &now
-			case StateRunning:
-				if job.cancel != nil {
-					job.cancel()
-				}
+			if job.State == StateRunning && job.cancel != nil {
+				job.cancel()
 			}
 		}
+		m.markPersistenceDirtyLocked()
+		shutdownSnapshot := m.persistenceSnapshotLocked()
 		m.cond.Broadcast()
 		m.mu.Unlock()
+		if m.store != nil {
+			if err := m.store.Save(shutdownSnapshot); err != nil {
+				log.Printf("ERROR: could not persist job state before shutdown: %v", err)
+			}
+		}
 		<-m.workerDone
+		m.persistBestEffort("final shutdown", 2)
 	})
 }
 

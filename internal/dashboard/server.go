@@ -39,7 +39,11 @@ func NewServer(roots *RootRegistry, shrinkrayBin, stateDir, version string) (*Se
 	}
 	s := &Server{roots: roots, stateDir: stateDir, version: version}
 	diskSpace := FilesystemDiskSpaceChecker{}
-	s.jobs = newJobManagerWithDiskSpace(roots, newCLIRunnerWithDiskSpace(roots, shrinkrayBin, diskSpace), diskSpace)
+	jobs, err := newPersistentJobManager(roots, newCLIRunnerWithDiskSpace(roots, shrinkrayBin, diskSpace), diskSpace, stateDir)
+	if err != nil {
+		return nil, err
+	}
+	s.jobs = jobs
 	s.handler = s.routes()
 	return s, nil
 }
@@ -53,6 +57,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/files", s.files)
 	mux.HandleFunc("/api/probe", s.probe)
 	mux.HandleFunc("/api/jobs", s.jobsEndpoint)
+	mux.HandleFunc("/api/jobs/history", s.jobHistory)
 	mux.HandleFunc("/api/jobs/", s.jobAction)
 
 	webRoot, err := fs.Sub(webAssets, "web")
@@ -154,7 +159,9 @@ func (s *Server) jobsEndpoint(w http.ResponseWriter, r *http.Request) {
 		job, err := s.jobs.Submit(request.RootID, request.Path, request.Preset, request.Container, request.KeepAllAudio, request.ExactMB)
 		if err != nil {
 			status := http.StatusBadRequest
-			if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "already targets") {
+			if errors.Is(err, ErrJobPersistence) {
+				status = http.StatusInternalServerError
+			} else if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "already targets") {
 				status = http.StatusConflict
 			}
 			writeError(w, status, err.Error())
@@ -164,6 +171,25 @@ func (s *Server) jobsEndpoint(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func (s *Server) jobHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1)
+	body, err := io.ReadAll(r.Body)
+	if err != nil || len(body) != 0 {
+		writeError(w, http.StatusBadRequest, "clear history request must not have a body")
+		return
+	}
+	removed, err := s.jobs.ClearHistory()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "cleared", "removed": removed})
 }
 
 func (s *Server) jobAction(w http.ResponseWriter, r *http.Request) {
