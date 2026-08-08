@@ -378,6 +378,34 @@ space falls below the critical 512 MB floor, it stops the encoder and removes
 only its `.part` output and temporary encoder files. This protection never
 deletes or modifies the original movie or unrelated files.
 
+### Hardware acceleration
+
+HEVC jobs accept `--encoder auto|software|qsv|vaapi|nvenc`. Auto mode checks
+the FFmpeg build, accessible DRM render devices, advertised hardware APIs, and
+a short generated-frame runtime encode before selecting Intel QSV, VAAPI,
+NVIDIA NVENC, or software x265 in that order. An encoder name in `ffmpeg
+-encoders` alone is not treated as proof that the GPU works. Use `shrinkray
+doctor` to see the detected devices, verified HEVC backends, and current auto
+selection.
+
+Software remains fully supported and keeps Shrinkray's existing two-pass x265
+behavior. Hardware encoding is single-pass and prioritizes speed, so its final
+size may vary somewhat more from the requested target. In auto mode, a hardware
+initialization/encode failure removes Shrinkray's exact temporary output and
+retries safely with software. An explicitly requested hardware backend fails
+clearly instead of silently changing the request.
+
+The normal Compose configuration requires no GPU. The management script uses
+`SHRINKRAY_HWACCEL=auto` to pass through one detected `/dev/dri/renderD*` device
+and only its numeric supplementary group, or an available NVIDIA container
+runtime. Set it to `none`, `dri`, or `nvidia` in `.env` to choose explicitly;
+`SHRINKRAY_DRM_RENDER_DEVICE` can select a particular render node. Equivalent
+manual deployments can use `compose.hwaccel.yaml` or `compose.nvidia.yaml` as an
+additional Compose file. No privileged mode, device permission changes, or GPU
+driver installation is performed. `scripts/shrinkray-docker.sh doctor` reports
+host devices, permissions, container visibility, NVIDIA runtime availability,
+and the container's verified encoder capabilities.
+
 MKV output keeps global metadata, chapters, and available subtitles. MP4 output
 drops subtitles because common movie subtitle formats are not always compatible
 with MP4. Audio is optional, so silent videos work too.

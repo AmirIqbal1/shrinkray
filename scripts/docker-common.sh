@@ -42,7 +42,7 @@ load_shrinkray_env() {
     case "$key" in
       SHRINKRAY_PORT|SHRINKRAY_UID|SHRINKRAY_GID|SHRINKRAY_MEDIA_GID|\
       SHRINKRAY_STATE_DIR|SHRINKRAY_MOVIES_PATH|SHRINKRAY_TV_PATH|\
-      SHRINKRAY_TAILSCALE_HTTPS_PORT) ;;
+      SHRINKRAY_TAILSCALE_HTTPS_PORT|SHRINKRAY_HWACCEL|SHRINKRAY_DRM_RENDER_DEVICE) ;;
       *)
         docker_common_die "unsupported setting in ${SHRINKRAY_ENV_FILE}: ${key}"
         return 1
@@ -57,9 +57,16 @@ load_shrinkray_env() {
 
   : "${SHRINKRAY_PORT:=8787}"
   : "${SHRINKRAY_TAILSCALE_HTTPS_PORT:=8443}"
+  : "${SHRINKRAY_HWACCEL:=auto}"
   export SHRINKRAY_PORT SHRINKRAY_UID SHRINKRAY_GID SHRINKRAY_MEDIA_GID
   export SHRINKRAY_STATE_DIR SHRINKRAY_MOVIES_PATH SHRINKRAY_TV_PATH
   export SHRINKRAY_TAILSCALE_HTTPS_PORT
+  export SHRINKRAY_HWACCEL SHRINKRAY_DRM_RENDER_DEVICE
+
+  case "$SHRINKRAY_HWACCEL" in
+    auto|none|dri|nvidia) ;;
+    *) docker_common_die 'SHRINKRAY_HWACCEL must be auto, none, dri, or nvidia'; return 1 ;;
+  esac
 
   local numeric
   for numeric in SHRINKRAY_PORT SHRINKRAY_UID SHRINKRAY_GID \
@@ -88,8 +95,63 @@ load_shrinkray_env() {
 run_compose() {
   (
     cd -- "$SHRINKRAY_REPO_DIR" || exit
-    docker compose "$@"
+    select_hardware_compose
+    docker compose "${SHRINKRAY_COMPOSE_HARDWARE_ARGS[@]}" "$@"
   )
+}
+
+find_render_device() {
+  local device
+  if [ -n "${SHRINKRAY_DRM_RENDER_DEVICE:-}" ]; then
+    [ -c "$SHRINKRAY_DRM_RENDER_DEVICE" ] || return 1
+    case "$SHRINKRAY_DRM_RENDER_DEVICE" in /dev/dri/renderD*) printf '%s\n' "$SHRINKRAY_DRM_RENDER_DEVICE"; return 0 ;; esac
+    return 1
+  fi
+  for device in /dev/dri/renderD*; do
+    [ -c "$device" ] || continue
+    printf '%s\n' "$device"
+    return 0
+  done
+  return 1
+}
+
+nvidia_runtime_installed() {
+  docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"'
+}
+
+nvidia_container_support_available() {
+  nvidia_runtime_installed || return 1
+  command -v nvidia-smi >/dev/null 2>&1 || return 1
+  nvidia-smi -L >/dev/null 2>&1
+}
+
+select_hardware_compose() {
+  local device mode
+  SHRINKRAY_COMPOSE_HARDWARE_ARGS=()
+  mode="${SHRINKRAY_HWACCEL:-auto}"
+  if [ "$mode" = none ]; then
+    return 0
+  fi
+  device="$(find_render_device 2>/dev/null || true)"
+  if { [ "$mode" = auto ] || [ "$mode" = dri ]; } && [ -n "$device" ]; then
+    SHRINKRAY_DRM_RENDER_DEVICE="$device"
+    SHRINKRAY_DRM_RENDER_GID="$(stat -c '%g' -- "$device")"
+    export SHRINKRAY_DRM_RENDER_DEVICE SHRINKRAY_DRM_RENDER_GID
+    SHRINKRAY_COMPOSE_HARDWARE_ARGS=(-f compose.yaml -f compose.hwaccel.yaml)
+    return 0
+  fi
+  if [ "$mode" = dri ]; then
+    docker_common_die 'no valid DRM render device was found; set SHRINKRAY_DRM_RENDER_DEVICE to /dev/dri/renderD*'
+    return 1
+  fi
+  if { [ "$mode" = auto ] || [ "$mode" = nvidia ]; } && nvidia_container_support_available; then
+    SHRINKRAY_COMPOSE_HARDWARE_ARGS=(-f compose.yaml -f compose.nvidia.yaml)
+    return 0
+  fi
+  if [ "$mode" = nvidia ]; then
+    docker_common_die 'usable NVIDIA GPU/container runtime support is unavailable'
+    return 1
+  fi
 }
 
 shrinkray_container_id() {

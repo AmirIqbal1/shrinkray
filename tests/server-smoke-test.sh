@@ -93,6 +93,16 @@ grep -q '"id":"tv","label":"TV"' "${TEMP_DIR}/health.json" || {
   printf 'server smoke test: TV root was missing from health response\n' >&2
   exit 1
 }
+curl -fsS "${BASE_URL}/api/capabilities" >"${TEMP_DIR}/capabilities.json"
+grep -q '"software":true' "${TEMP_DIR}/capabilities.json" || {
+  printf 'server smoke test: software encoder capability was missing\n' >&2
+  exit 1
+}
+curl -fsS "${BASE_URL}/encoder-options.js" >"${TEMP_DIR}/encoder-options.js"
+grep -q 'buildEncoderOptions' "${TEMP_DIR}/encoder-options.js" || {
+  printf 'server smoke test: encoder selector helper was not served\n' >&2
+  exit 1
+}
 if grep -Fq "$MOVIES_ROOT" "${TEMP_DIR}/health.json" || grep -Fq "$TV_ROOT" "${TEMP_DIR}/health.json"; then
   printf 'server smoke test: health response exposed an absolute root path\n' >&2
   exit 1
@@ -123,6 +133,10 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   "${BASE_URL}/api/jobs" >"${TEMP_DIR}/created-tv.json"
 if ! grep -q '"state":"queued"' "${TEMP_DIR}/created-movie.json" || ! grep -q '"state":"queued"' "${TEMP_DIR}/created-tv.json"; then
   printf 'server smoke test: submitted jobs were not queued\n' >&2
+  exit 1
+fi
+if ! grep -q '"requested_encoder":"auto"' "${TEMP_DIR}/created-movie.json" || ! grep -q '"requested_encoder":"auto"' "${TEMP_DIR}/created-tv.json"; then
+  printf 'server smoke test: submitted jobs did not default to automatic encoder selection\n' >&2
   exit 1
 fi
 if ! grep -Eq '"disk_available_bytes":[1-9]' "${TEMP_DIR}/created-movie.json" || ! grep -Eq '"disk_required_bytes":[1-9]' "${TEMP_DIR}/created-movie.json"; then
@@ -166,6 +180,11 @@ done
 }
 if [ "$(grep -o '"progress_percent":100' "${TEMP_DIR}/jobs.json" | wc -l)" -lt 2 ]; then
   printf 'server smoke test: completed jobs did not report 100%%\n' >&2
+  sed -n '1,200p' "${TEMP_DIR}/jobs.json" >&2
+  exit 1
+fi
+if [ "$(grep -o '"actual_encoder":"software"' "${TEMP_DIR}/jobs.json" | wc -l)" -lt 2 ]; then
+  printf 'server smoke test: completed jobs did not report their actual encoder backend\n' >&2
   sed -n '1,200p' "${TEMP_DIR}/jobs.json" >&2
   exit 1
 fi

@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [ "${1-}" = capabilities ] && [ "${2-}" = --json ]; then
+  printf '{"encoders":{"software":true,"qsv":false,"vaapi":false,"nvenc":false},"auto_selected":"software","devices":{"qsv":"","vaapi":""}}\n'
+  exit 0
+fi
+
 input="${1:?input is required}"
 shift
 container="mkv"
 machine_progress=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --size|--quality)
+    --size|--quality|--encoder)
       shift 2
       ;;
     --container)

@@ -461,6 +461,27 @@ func TestPersistedStateDoesNotContainRuntimeAbsoluteOutputPath(t *testing.T) {
 	}
 }
 
+func TestRequestedAndActualEncoderPersistAndLegacyDefaultsSafely(t *testing.T) {
+	mediaDir, stateDir := t.TempDir(), t.TempDir()
+	finished := time.Now().UTC()
+	jobs := []*Job{
+		{ID: "1", State: StateCompleted, Stage: "Completed", Settings: JobSettings{RequestedEncoder: "qsv"}, ActualEncoder: "qsv", QueuedAt: finished, FinishedAt: &finished, Logs: []string{}},
+		{ID: "2", State: StateCompleted, Stage: "Completed", Settings: JobSettings{}, QueuedAt: finished, FinishedAt: &finished, Logs: []string{}},
+	}
+	store := newJobStateStore(stateDir)
+	if err := store.Save(jobStateSnapshot{revision: 1, state: persistedJobState{Version: jobStateVersion, NextID: 3, Jobs: jobs}}); err != nil {
+		t.Fatal(err)
+	}
+	manager := persistentManagerFixture(t, mediaDir, stateDir, newControlledRunner())
+	defer manager.Close()
+	if restored := findJob(t, manager, "1"); restored.Settings.RequestedEncoder != "qsv" || restored.ActualEncoder != "qsv" {
+		t.Fatalf("hardware history lost backend fields: %#v", restored)
+	}
+	if legacy := findJob(t, manager, "2"); legacy.Settings.RequestedEncoder != "software" || legacy.ActualEncoder != "" {
+		t.Fatalf("legacy encoder defaults = %#v", legacy)
+	}
+}
+
 func TestProgressPersistenceIsThrottled(t *testing.T) {
 	mediaDir, stateDir := t.TempDir(), t.TempDir()
 	manager := persistentManagerFixture(t, mediaDir, stateDir, burstProgressRunner{})

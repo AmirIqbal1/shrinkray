@@ -4,6 +4,7 @@ const state = {
   roots: [],
   rootID: '',
   jobs: [],
+  capabilities: { encoders: { software: true, qsv: false, vaapi: false, nvenc: false }, auto_selected: 'software' },
   expandedLogJobs: new Set(),
   knownLogJobs: new Set(),
   logScrollJobs: new Map(),
@@ -81,6 +82,26 @@ async function loadHealth() {
     showNotice(error.message);
     return false;
   }
+}
+
+async function loadCapabilities() {
+  try {
+    const result = await api('/api/capabilities');
+    const encoders = result?.encoders && typeof result.encoders === 'object' ? result.encoders : {};
+    state.capabilities = {
+      encoders: {
+        software: encoders.software === true,
+        qsv: encoders.qsv === true,
+        vaapi: encoders.vaapi === true,
+        nvenc: encoders.nvenc === true,
+      },
+      auto_selected: typeof result?.auto_selected === 'string' ? result.auto_selected : '',
+    };
+  } catch (error) {
+    showNotice(`Encoder capabilities unavailable: ${error.message}`);
+  }
+  const options = window.ShrinkrayEncoderOptions.buildEncoderOptions(state.capabilities.encoders);
+  $('#encoder').innerHTML = options.map((option) => `<option value="${option.value}">${option.label}</option>`).join('');
 }
 
 function currentRoot() {
@@ -222,6 +243,7 @@ async function submitJob(event) {
     preset,
     container: $('#container').value,
     keep_all_audio: $('#audio').value === 'all',
+    requested_encoder: $('#encoder').value,
     exact_mb: preset === 'exact' ? exact : 0,
   };
   try {
@@ -238,7 +260,12 @@ function jobSettings(job) {
   const labels = { balanced: 'Balanced', smaller: 'Smaller', better: 'Better quality', exact: 'Exact size' };
   const preset = labels[job.settings.preset] || 'Custom';
   const container = String(job.settings.container || 'mkv').toUpperCase();
-  return `${preset} · ${job.settings.quality || 'good'} · ${container} · ${job.settings.keep_all_audio ? 'all audio' : 'first audio'}`;
+  const requested = encoderDisplayName(job.settings.requested_encoder || 'software');
+  return `${preset} · ${job.settings.quality || 'good'} · ${container} · ${job.settings.keep_all_audio ? 'all audio' : 'first audio'} · requested ${requested}`;
+}
+
+function encoderDisplayName(encoder) {
+  return ({ auto: 'Auto', software: 'Software x265', qsv: 'Intel QSV', vaapi: 'VAAPI', nvenc: 'NVIDIA NVENC' })[encoder] || 'Legacy software';
 }
 
 function normalizeJob(job) {
@@ -271,6 +298,7 @@ function normalizeJob(job) {
     disk_space_warning: job.disk_space_warning === true,
     result_size: numberOrZero(job.result_size),
     saved_percent: numberOrZero(job.saved_percent),
+    actual_encoder: typeof job.actual_encoder === 'string' ? job.actual_encoder : '',
     logs: Array.isArray(job.logs) ? job.logs : [],
     settings: {
       preset: typeof settings.preset === 'string' ? settings.preset : 'balanced',
@@ -278,6 +306,7 @@ function normalizeJob(job) {
       container: typeof settings.container === 'string' ? settings.container : 'mkv',
       keep_all_audio: settings.keep_all_audio === true,
       target_mb: numberOrZero(settings.target_mb),
+      requested_encoder: typeof settings.requested_encoder === 'string' ? settings.requested_encoder : 'software',
     },
   };
 }
@@ -332,6 +361,7 @@ function renderJob(job) {
     ? `<div class="result"><strong>100% · Completed</strong><span>${formatBytes(job.result_size)} · ${job.saved_percent >= 0 ? `${job.saved_percent.toFixed(1)}% saved` : 'output is larger'}</span></div>`
     : '';
   const failure = job.failure ? `<p class="failure">${escapeHTML(job.failure)}</p>` : '';
+  const actualEncoder = job.actual_encoder ? `<p class="encoder-used">Encoder: <strong>${escapeHTML(encoderDisplayName(job.actual_encoder))}</strong></p>` : '';
   const logLines = Array.isArray(job.logs) ? job.logs : [];
   const hasStoredLogState = state.knownLogJobs.has(job.id);
   const logsOpen = hasStoredLogState ? state.expandedLogJobs.has(job.id) : active;
@@ -348,7 +378,7 @@ function renderJob(job) {
         <div class="job-copy"><div class="job-title"><strong>${escapeHTML(job.filename)}</strong><span class="state-pill">${escapeHTML(job.state)}</span></div>
           <p>${escapeHTML(job.root_label)} · ${job.settings.target_mb.toLocaleString()} MB target · ${escapeHTML(jobSettings(job))} · queued ${escapeHTML(formatQueued(job.queued_at))}</p>
           <div class="stage"><span>${escapeHTML(job.stage)}</span><small>${formatElapsed(job.elapsed_seconds)}</small></div>
-          ${progress}${disk}${failure}${logs}
+          ${progress}${disk}${actualEncoder}${failure}${logs}
         </div>
         ${result}
         ${cancellable ? `<button class="cancel" data-cancel="${job.id}">Cancel</button>` : ''}
@@ -500,6 +530,7 @@ $('#jobs').addEventListener('scroll', (event) => {
 
 async function initialize() {
   await loadHealth();
+  await loadCapabilities();
   await loadFiles();
   await loadJobs();
   setInterval(loadJobs, 1000);

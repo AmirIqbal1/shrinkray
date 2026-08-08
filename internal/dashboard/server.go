@@ -1,11 +1,13 @@
 package dashboard
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"errors"
 	"io"
 	"io/fs"
+	"log"
 	"net/http"
 	"path"
 	"strings"
@@ -17,27 +19,33 @@ const maxJSONBody = 64 << 10
 var webAssets embed.FS
 
 type Server struct {
-	roots    *RootRegistry
-	jobs     *JobManager
-	stateDir string
-	version  string
-	handler  http.Handler
+	roots        *RootRegistry
+	jobs         *JobManager
+	stateDir     string
+	version      string
+	handler      http.Handler
+	capabilities EncoderCapabilities
 }
 
 type createJobRequest struct {
-	RootID       string `json:"root_id"`
-	Path         string `json:"path"`
-	Preset       string `json:"preset"`
-	Container    string `json:"container"`
-	KeepAllAudio bool   `json:"keep_all_audio"`
-	ExactMB      int64  `json:"exact_mb"`
+	RootID           string `json:"root_id"`
+	Path             string `json:"path"`
+	Preset           string `json:"preset"`
+	Container        string `json:"container"`
+	KeepAllAudio     bool   `json:"keep_all_audio"`
+	ExactMB          int64  `json:"exact_mb"`
+	RequestedEncoder string `json:"requested_encoder"`
 }
 
 func NewServer(roots *RootRegistry, shrinkrayBin, stateDir, version string) (*Server, error) {
 	if roots == nil || len(roots.Roots()) == 0 {
 		return nil, errors.New("at least one media root is required")
 	}
-	s := &Server{roots: roots, stateDir: stateDir, version: version}
+	capabilities, capabilityErr := detectEncoderCapabilities(context.Background(), shrinkrayBin)
+	if capabilityErr != nil {
+		log.Printf("WARNING: hardware capability detection failed: %v", capabilityErr)
+	}
+	s := &Server{roots: roots, stateDir: stateDir, version: version, capabilities: capabilities}
 	diskSpace := FilesystemDiskSpaceChecker{}
 	jobs, err := newPersistentJobManager(roots, newCLIRunnerWithDiskSpace(roots, shrinkrayBin, diskSpace), diskSpace, stateDir)
 	if err != nil {
@@ -54,6 +62,7 @@ func (s *Server) Close()                { s.jobs.Close() }
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", s.health)
+	mux.HandleFunc("/api/capabilities", s.encoderCapabilities)
 	mux.HandleFunc("/api/files", s.files)
 	mux.HandleFunc("/api/probe", s.probe)
 	mux.HandleFunc("/api/jobs", s.jobsEndpoint)
@@ -70,7 +79,7 @@ func (s *Server) routes() http.Handler {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		if r.URL.Path != "/" && r.URL.Path != "/app.js" && r.URL.Path != "/log-scroll.js" && r.URL.Path != "/styles.css" {
+		if r.URL.Path != "/" && r.URL.Path != "/app.js" && r.URL.Path != "/log-scroll.js" && r.URL.Path != "/encoder-options.js" && r.URL.Path != "/styles.css" {
 			http.NotFound(w, r)
 			return
 		}
@@ -84,6 +93,14 @@ func (s *Server) routes() http.Handler {
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'")
 		mux.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) encoderCapabilities(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	writeJSON(w, http.StatusOK, s.capabilities)
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
@@ -156,7 +173,7 @@ func (s *Server) jobsEndpoint(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid job request")
 			return
 		}
-		job, err := s.jobs.Submit(request.RootID, request.Path, request.Preset, request.Container, request.KeepAllAudio, request.ExactMB)
+		job, err := s.jobs.Submit(request.RootID, request.Path, request.Preset, request.Container, request.KeepAllAudio, request.ExactMB, request.RequestedEncoder)
 		if err != nil {
 			status := http.StatusBadRequest
 			if errors.Is(err, ErrJobPersistence) {

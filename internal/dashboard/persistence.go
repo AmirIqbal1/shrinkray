@@ -233,6 +233,10 @@ func (m *JobManager) restore(state persistedJobState) bool {
 		job.cancel = nil
 		job.outputAbs = ""
 		job.lastProgressPersist = time.Time{}
+		if job.Settings.RequestedEncoder == "" {
+			job.Settings.RequestedEncoder = "software"
+			changed = true
+		}
 		if job.Logs == nil {
 			job.Logs = []string{}
 		}

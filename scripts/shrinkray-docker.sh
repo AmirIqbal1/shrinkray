@@ -100,7 +100,7 @@ doctor_check() {
 }
 
 doctor() {
-  local container_id running health mounts user_spec ss_status serve_status tailscale_json
+  local container_id running health mounts user_spec ss_status serve_status tailscale_json render_devices device_permissions container_devices capabilities nvidia_runtime
   DOCTOR_ISSUES=0
 
   doctor_check 'Docker daemon is available' docker info
@@ -126,6 +126,22 @@ doctor() {
   doctor_check 'TV mount is present' grep -Fxq /media/tv <<<"$mounts"
   doctor_check 'State mount is present' grep -Fxq /var/lib/shrinkray <<<"$mounts"
   doctor_check 'Container UID/GID matches .env' test "$user_spec" = "${SHRINKRAY_UID}:${SHRINKRAY_GID}"
+
+  render_devices="$(find /dev/dri -maxdepth 1 -type c -name 'renderD*' -print 2>/dev/null || true)"
+  printf 'DRM render devices detected:\n%s\n' "${render_devices:-  none}"
+  device_permissions=""
+  while IFS= read -r device; do
+    [ -n "$device" ] || continue
+    device_permissions+="$(stat -c '  %n mode=%a uid=%u gid=%g' -- "$device")"$'\n'
+  done <<<"$render_devices"
+  printf 'Render-device permissions:\n%s' "${device_permissions:-  none$'\n'}"
+  container_devices=""
+  [ -z "$container_id" ] || container_devices="$(docker exec "$container_id" sh -c 'find /dev/dri -maxdepth 1 -name "renderD*" -print 2>/dev/null' || true)"
+  printf 'Container-visible render devices:\n%s\n' "${container_devices:-  none}"
+  if nvidia_runtime_installed; then nvidia_runtime=available; else nvidia_runtime=unavailable; fi
+  printf 'NVIDIA container runtime: %s\n' "$nvidia_runtime"
+  capabilities="$(curl --fail --silent --show-error "${SHRINKRAY_BACKEND}/api/capabilities" 2>/dev/null || true)"
+  printf 'Container encoder capabilities: %s\n' "${capabilities:-unavailable}"
 
   ss_status="$(ss -ltnp 2>&1 || true)"
   show_port_owner "$ss_status" 443
