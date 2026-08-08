@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func makeTwoRootServer(t *testing.T) (*Server, string, string) {
@@ -118,5 +119,53 @@ func TestDashboardServesLogScrollHelpersBeforeApplication(t *testing.T) {
 	helpers := requestServer(t, server, http.MethodGet, "/log-scroll.js", nil)
 	if helpers.Code != http.StatusOK || !strings.Contains(helpers.Body.String(), "captureLogScroll") {
 		t.Fatalf("log scroll helper response = %d, %s", helpers.Code, helpers.Body.String())
+	}
+}
+
+func TestClearHistoryEndpointAndDashboardControls(t *testing.T) {
+	movies, _ := makeRootDirectories(t)
+	stateDir := t.TempDir()
+	finished := time.Now().UTC()
+	store := newJobStateStore(stateDir)
+	if err := store.Save(jobStateSnapshot{revision: 1, state: persistedJobState{
+		Version: jobStateVersion,
+		NextID:  8,
+		Jobs: []*Job{{
+			ID: "7", RootID: "movies", RootLabel: "Movies", Path: "old.mkv", Filename: "old.mkv",
+			State: StateFailed, Stage: "Failed", QueuedAt: finished, FinishedAt: &finished, Logs: []string{},
+		}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := NewRootRegistry([]string{"Movies=" + movies})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(registry, "unused-shrinkray", stateDir, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(server.Close)
+
+	response := requestServer(t, server, http.MethodDelete, "/api/jobs/history", nil)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"removed":1`) {
+		t.Fatalf("clear history response = %d, %s", response.Code, response.Body.String())
+	}
+	jobs := requestServer(t, server, http.MethodGet, "/api/jobs", nil)
+	if jobs.Code != http.StatusOK || strings.Contains(jobs.Body.String(), `"id":"7"`) {
+		t.Fatalf("cleared history remained in API: %d, %s", jobs.Code, jobs.Body.String())
+	}
+	wrongMethod := requestServer(t, server, http.MethodPost, "/api/jobs/history", nil)
+	if wrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("clear history POST status = %d; want %d", wrongMethod.Code, http.StatusMethodNotAllowed)
+	}
+
+	index := requestServer(t, server, http.MethodGet, "/", nil)
+	if !strings.Contains(index.Body.String(), "Active / queued jobs") || !strings.Contains(index.Body.String(), "Clear history") {
+		t.Fatalf("dashboard does not distinguish active jobs and history: %s", index.Body.String())
+	}
+	application := requestServer(t, server, http.MethodGet, "/app.js", nil)
+	if !strings.Contains(application.Body.String(), "Clear completed, failed and cancelled job history?") {
+		t.Fatal("dashboard clear-history confirmation is missing")
 	}
 }

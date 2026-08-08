@@ -390,21 +390,23 @@ function renderJobs() {
   const container = $('#jobs');
   rememberLogPanelState(container);
   pruneLogPanelState();
-  if (!state.jobs.length) {
-    if (!container.querySelector('.queue-empty')) {
-      container.innerHTML = '<div class="empty queue-empty">No jobs yet. Choose a movie above to get started.</div>';
-    }
-    return;
-  }
-
   const previousCards = new Map(Array.from(container.querySelectorAll('.job[data-job-id]'), (card) => [card.dataset.jobId, card]));
   const restorations = [];
-  const nextCards = state.jobs.map((job) => {
+  const createCards = (jobs) => jobs.map((job) => {
     const card = createJobCard(job);
     reconcileLogPanel(previousCards.get(job.id), card, restorations);
     return card;
   });
-  container.replaceChildren(...nextCards);
+  const activeJobs = state.jobs.filter((job) => job.state === 'queued' || job.state === 'running');
+  const historyJobs = state.jobs.filter((job) => job.state === 'completed' || job.state === 'failed' || job.state === 'cancelled');
+  const activeContainer = $('#active-jobs');
+  const historyContainer = $('#history-jobs');
+  const historySection = $('#history-section');
+  const activeCards = createCards(activeJobs);
+  if (activeCards.length) activeContainer.replaceChildren(...activeCards);
+  else activeContainer.innerHTML = '<div class="empty queue-empty">No active or queued jobs.</div>';
+  historyContainer.replaceChildren(...createCards(historyJobs));
+  historySection.hidden = historyJobs.length === 0;
   restorations.forEach(({ id, details, log, snapshot }) => {
     if (details.open) {
       restoreLogScroll(log, snapshot, true);
@@ -413,6 +415,17 @@ function renderJobs() {
       state.logScrollJobs.set(id, snapshot || { followingBottom: true, distanceFromBottom: 0 });
     }
   });
+}
+
+async function clearHistory() {
+  if (!window.confirm('Clear completed, failed and cancelled job history?')) return;
+  try {
+    const result = await api('/api/jobs/history', { method: 'DELETE' });
+    await loadJobs();
+    showNotice(`${Number(result.removed) || 0} history record(s) cleared. Media files were not changed.`, 'success');
+  } catch (error) {
+    showNotice(error.message);
+  }
 }
 
 async function loadJobs() {
@@ -453,6 +466,11 @@ $('#job-form').addEventListener('submit', submitJob);
 document.querySelectorAll('input[name="preset"]').forEach((input) => input.addEventListener('change', updateTarget));
 $('#exact-size').addEventListener('input', updateTarget);
 $('#jobs').addEventListener('click', (event) => {
+  const clearButton = event.target.closest('#clear-history');
+  if (clearButton) {
+    clearHistory();
+    return;
+  }
   const button = event.target.closest('[data-cancel]');
   if (button) cancelJob(button.dataset.cancel);
 });

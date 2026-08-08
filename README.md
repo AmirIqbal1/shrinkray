@@ -156,6 +156,20 @@ Additional server flags are `--state-dir` (default
 `127.0.0.1:8787`). The server version is independent of the Bash CLI; this
 multi-library release is `shrinkray-server v0.2.0`.
 
+### Persistent job history
+
+The dashboard stores its queue and recent job history in `jobs.json` under the
+configured Shrinkray state directory. Docker persists `/var/lib/shrinkray`, so
+completed, failed, cancelled, and queued records survive container recreation.
+Queued work is validated and restored after restart. An encode interrupted by a
+restart is marked failed and must be submitted again; it is never resumed in the
+middle of an encode.
+
+Shrinkray retains the newest 250 finished jobs together with every active or
+queued job. The dashboard's **Clear history** action removes completed, failed,
+and cancelled records only. It never removes source movies, compressed output,
+queued work, or running jobs.
+
 ### Docker home-server deployment
 
 Docker is the recommended way to run the dashboard on a home server. Tailscale

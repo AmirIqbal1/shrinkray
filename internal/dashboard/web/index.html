@@ -53,8 +53,14 @@
     </section>
 
     <section class="queue-section">
-      <div class="queue-heading"><div><span class="eyebrow">ENCODE QUEUE</span><h2>Jobs</h2></div><p>One movie runs at a time to keep your server responsive.</p></div>
-      <div id="jobs" class="jobs"><div class="empty queue-empty">No jobs yet. Choose a movie above to get started.</div></div>
+      <div class="queue-heading"><div><span class="eyebrow">ENCODE QUEUE</span><h2>Active / queued jobs</h2></div><p>One movie runs at a time to keep your server responsive.</p></div>
+      <div id="jobs">
+        <div id="active-jobs" class="jobs"><div class="empty queue-empty">No active jobs. Choose a movie above to get started.</div></div>
+        <section id="history-section" class="history-section" hidden>
+          <div class="queue-heading history-heading"><div><span class="eyebrow">JOB HISTORY</span><h2>Finished jobs</h2></div><button id="clear-history" class="clear-history" type="button">Clear history</button></div>
+          <div id="history-jobs" class="jobs"></div>
+        </section>
+      </div>
     </section>
   </main>
   <footer>SHRINKRAY SERVER <span>·</span> ORIGINAL FILES ARE NEVER REPLACED</footer>

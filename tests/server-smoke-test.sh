@@ -182,4 +182,44 @@ fi
   exit 1
 }
 
+kill "$SERVER_PID"
+wait "$SERVER_PID" 2>/dev/null || true
+SERVER_PID=""
+: >"$SERVER_LOG"
+BASE_URL=""
+"$SERVER_BIN" \
+  --root "Movies=${MOVIES_ROOT}" \
+  --root "TV=${TV_ROOT}" \
+  --listen "127.0.0.1:0" \
+  --shrinkray-bin "$FAKE_SHRINKRAY" \
+  --state-dir "$STATE_DIR" >"$SERVER_LOG" 2>&1 &
+SERVER_PID="$!"
+for _ in $(seq 1 100); do
+  BASE_URL="$(sed -n 's/.*listening on http:\/\/\(127\.0\.0\.1:[0-9][0-9]*\).*/http:\/\/\1/p' "$SERVER_LOG" | tail -n 1)"
+  if [ -n "$BASE_URL" ] && curl -fsS "${BASE_URL}/api/jobs" >"${TEMP_DIR}/restored-jobs.json" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    printf 'server smoke test: restarted server exited during startup\n' >&2
+    sed -n '1,160p' "$SERVER_LOG" >&2
+    exit 1
+  fi
+  sleep 0.05
+done
+if [ "$(grep -o '"state":"completed"' "${TEMP_DIR}/restored-jobs.json" | wc -l)" -lt 2 ]; then
+  printf 'server smoke test: completed history did not survive restart\n' >&2
+  sed -n '1,200p' "${TEMP_DIR}/restored-jobs.json" >&2
+  exit 1
+fi
+curl -fsS -X DELETE "${BASE_URL}/api/jobs/history" >"${TEMP_DIR}/clear-history.json"
+grep -Eq '"removed":[2-9]' "${TEMP_DIR}/clear-history.json" || {
+  printf 'server smoke test: clear history did not remove finished records\n' >&2
+  sed -n '1,200p' "${TEMP_DIR}/clear-history.json" >&2
+  exit 1
+}
+if [ ! -s "${MOVIES_ROOT}/dashboard-movie.shrunk.mkv" ] || [ ! -s "${TV_ROOT}/dashboard-episode.shrunk.mkv" ]; then
+  printf 'server smoke test: clear history changed encoded media\n' >&2
+  exit 1
+fi
+
 printf 'Server smoke test passed.\n'
