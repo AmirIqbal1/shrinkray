@@ -23,6 +23,13 @@ VIDEO_EXTS="mkv mp4 m4v avi mov wmv flv webm ts"
 AUDIO_KBPS=128
 ACTIVE_TEMP=""
 ACTIVE_WORKDIR=""
+ACTIVE_ENCODER_PID=""
+ACTIVE_MONITOR_PID=""
+ACTIVE_OUTPUT_DIR=""
+CRITICAL_DISK_TRIGGERED=false
+ENCODER_WORKING_ALLOWANCE_BYTES=$((512 * 1024 * 1024))
+MINIMUM_SAFETY_RESERVE_BYTES=$((2 * 1024 * 1024 * 1024))
+CRITICAL_FREE_SPACE_BYTES=$((512 * 1024 * 1024))
 
 say() { printf '==> %s\n' "$*"; }
 warn() { printf '!!  %s\n' "$*" >&2; }
@@ -66,6 +73,14 @@ EOF
 }
 
 cleanup_active() {
+  if [ -n "$ACTIVE_MONITOR_PID" ] && kill -0 "$ACTIVE_MONITOR_PID" 2>/dev/null; then
+    kill "$ACTIVE_MONITOR_PID" 2>/dev/null || true
+    wait "$ACTIVE_MONITOR_PID" 2>/dev/null || true
+  fi
+  if [ -n "$ACTIVE_ENCODER_PID" ] && kill -0 "$ACTIVE_ENCODER_PID" 2>/dev/null; then
+    kill -TERM "$ACTIVE_ENCODER_PID" 2>/dev/null || true
+    wait "$ACTIVE_ENCODER_PID" 2>/dev/null || true
+  fi
   if [ -n "$ACTIVE_TEMP" ] && [ -e "$ACTIVE_TEMP" ]; then
     rm -f -- "$ACTIVE_TEMP"
   fi
@@ -74,6 +89,9 @@ cleanup_active() {
   fi
   ACTIVE_TEMP=""
   ACTIVE_WORKDIR=""
+  ACTIVE_ENCODER_PID=""
+  ACTIVE_MONITOR_PID=""
+  ACTIVE_OUTPUT_DIR=""
 }
 
 handle_signal() {
@@ -104,6 +122,110 @@ human_size_mb() {
 
 file_size_bytes() {
   stat -c '%s' -- "$1"
+}
+
+human_bytes() {
+  awk -v bytes="$1" 'BEGIN {
+    split("B KB MB GB TB PB EB", units, " ")
+    value = bytes + 0
+    unit = 1
+    while (value >= 1024 && unit < 7) { value /= 1024; unit++ }
+    if (value >= 100 || unit <= 2) printf "%.0f %s\n", value, units[unit]
+    else printf "%.1f %s\n", value, units[unit]
+  }'
+}
+
+collect_disk_space() {
+  local directory="$1"
+  local target_bytes="$2"
+  local available_blocks block_size total_blocks values
+  read -r available_blocks block_size total_blocks < <(stat -f -c '%a %S %b' -- "$directory" 2>/dev/null) || return 1
+  [[ "$available_blocks" =~ ^[0-9]+$ && "$block_size" =~ ^[0-9]+$ && "$total_blocks" =~ ^[0-9]+$ ]] || return 1
+  values="$(awk \
+    -v available_blocks="$available_blocks" \
+    -v block_size="$block_size" \
+    -v total_blocks="$total_blocks" \
+    -v target="$target_bytes" \
+    -v allowance="$ENCODER_WORKING_ALLOWANCE_BYTES" \
+    -v minimum_reserve="$MINIMUM_SAFETY_RESERVE_BYTES" 'BEGIN {
+      max = 9000000000000000000
+      available = available_blocks * block_size
+      capacity = total_blocks * block_size
+      if (available > max) available = max
+      if (capacity > max) capacity = max
+      reserve = int(capacity / 10)
+      if (reserve < minimum_reserve) reserve = minimum_reserve
+      required = target + allowance + reserve
+      if (required > max) required = max
+      printf "%.0f %.0f %.0f %.0f\n", available, capacity, reserve, required
+    }')" || return 1
+  read -r DISK_AVAILABLE_BYTES DISK_CAPACITY_BYTES DISK_RESERVE_BYTES DISK_REQUIRED_BYTES <<< "$values"
+  [[ "$DISK_AVAILABLE_BYTES" =~ ^[0-9]+$ && "$DISK_REQUIRED_BYTES" =~ ^[0-9]+$ ]] || return 1
+}
+
+check_disk_space_preflight() {
+  local directory="$1"
+  local target_bytes="$2"
+  if ! collect_disk_space "$directory" "$target_bytes"; then
+    warn "Could not inspect free space on the destination filesystem."
+    return 1
+  fi
+  say "Disk space check"
+  printf '    Available: %s\n' "$(human_bytes "$DISK_AVAILABLE_BYTES")"
+  printf '    Required: %s\n' "$(human_bytes "$DISK_REQUIRED_BYTES")"
+  printf '    Safety reserve: %s\n' "$(human_bytes "$DISK_RESERVE_BYTES")"
+  if [ "$DISK_AVAILABLE_BYTES" -lt "$DISK_REQUIRED_BYTES" ]; then
+    warn "Not enough free disk space."
+    warn "Available: $(human_bytes "$DISK_AVAILABLE_BYTES")"
+    warn "Required: $(human_bytes "$DISK_REQUIRED_BYTES")"
+    warn "Shrinkray will not start this encode."
+    return 1
+  fi
+  say "Disk space: OK"
+}
+
+run_ffmpeg_with_disk_guard() {
+  local encoder_status critical_flag
+  critical_flag="${ACTIVE_WORKDIR}/critical-low-disk-space"
+  rm -f -- "$critical_flag"
+  "$@" &
+  ACTIVE_ENCODER_PID="$!"
+  (
+    local warned=false
+    while kill -0 "$ACTIVE_ENCODER_PID" 2>/dev/null; do
+      if collect_disk_space "$ACTIVE_OUTPUT_DIR" 0; then
+        if [ "$DISK_AVAILABLE_BYTES" -lt "$CRITICAL_FREE_SPACE_BYTES" ]; then
+          : > "$critical_flag"
+          warn "Critical low disk space"
+          kill -TERM "$ACTIVE_ENCODER_PID" 2>/dev/null || true
+          exit 0
+        fi
+      elif [ "$warned" = false ]; then
+        warn "Could not refresh destination disk space while encoding."
+        warned=true
+      fi
+      sleep 1
+    done
+  ) &
+  ACTIVE_MONITOR_PID="$!"
+
+  if wait "$ACTIVE_ENCODER_PID"; then
+    encoder_status=0
+  else
+    encoder_status="$?"
+  fi
+  ACTIVE_ENCODER_PID=""
+  if kill -0 "$ACTIVE_MONITOR_PID" 2>/dev/null; then
+    kill "$ACTIVE_MONITOR_PID" 2>/dev/null || true
+  fi
+  wait "$ACTIVE_MONITOR_PID" 2>/dev/null || true
+  ACTIVE_MONITOR_PID=""
+
+  if [ -e "$critical_flag" ]; then
+    CRITICAL_DISK_TRIGGERED=true
+    return 1
+  fi
+  return "$encoder_status"
 }
 
 is_video_file() {
@@ -448,7 +570,7 @@ run_hevc_encode() {
   local -a mapping_args=("$@")
 
   say "Encoding with HEVC (pass 1 of 2)..."
-  if ! ffmpeg -y -hide_banner -loglevel warning "${FFMPEG_PROGRESS_ARGS[@]}" \
+  if ! run_ffmpeg_with_disk_guard ffmpeg -y -hide_banner -loglevel warning "${FFMPEG_PROGRESS_ARGS[@]}" \
       -i "$input" -map 0:v:0 \
       -c:v libx265 -preset "$X265_PRESET" -b:v "${video_kbps}k" \
       -x265-params "pass=1:stats=${ACTIVE_WORKDIR}/x265_2pass.log:log-level=error" \
@@ -458,7 +580,7 @@ run_hevc_encode() {
   fi
 
   say "Encoding with HEVC (pass 2 of 2)..."
-  if ! ffmpeg -y -hide_banner -loglevel warning "${FFMPEG_PROGRESS_ARGS[@]}" \
+  if ! run_ffmpeg_with_disk_guard ffmpeg -y -hide_banner -loglevel warning "${FFMPEG_PROGRESS_ARGS[@]}" \
       -i "$input" "${mapping_args[@]}" \
       -map_metadata 0 -map_chapters 0 \
       -c:v libx265 -preset "$X265_PRESET" -b:v "${video_kbps}k" \
@@ -479,7 +601,7 @@ run_av1_encode() {
   local -a mapping_args=("$@")
 
   say "Encoding with AV1... software AV1 encoding can be very slow."
-  ffmpeg -y -hide_banner -loglevel warning "${FFMPEG_PROGRESS_ARGS[@]}" \
+  run_ffmpeg_with_disk_guard ffmpeg -y -hide_banner -loglevel warning "${FFMPEG_PROGRESS_ARGS[@]}" \
     -i "$input" "${mapping_args[@]}" \
     -map_metadata 0 -map_chapters 0 \
     -c:v libsvtav1 -preset "$SVT_PRESET" -b:v "${video_kbps}k" \
@@ -558,9 +680,15 @@ process_file() {
     esac
   fi
 
+  if ! check_disk_space_preflight "$(dirname -- "$output")" "$target_bytes"; then
+    return 1
+  fi
+
   cleanup_active
+  CRITICAL_DISK_TRIGGERED=false
   ACTIVE_TEMP="${output}.part"
   ACTIVE_WORKDIR="$(mktemp -d)"
+  ACTIVE_OUTPUT_DIR="$(dirname -- "$output")"
   rm -f -- "$ACTIVE_TEMP"
 
   mapping_args=(-map 0:v:0)
@@ -578,6 +706,11 @@ process_file() {
     if ! run_av1_encode "$input" "$ACTIVE_TEMP" "$video_kbps" "${mapping_args[@]}" || \
         ! validate_output "$ACTIVE_TEMP"; then
       rm -f -- "$ACTIVE_TEMP"
+      if [ "$CRITICAL_DISK_TRIGGERED" = true ]; then
+        warn "Encoding stopped because the destination filesystem has critically low free space."
+        cleanup_active
+        return 1
+      fi
       if [ "$HAS_X265" = true ]; then
         warn "AV1 encoding or validation failed; retrying with available HEVC/libx265."
         codec="hevc"

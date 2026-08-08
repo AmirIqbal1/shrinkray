@@ -27,7 +27,7 @@ func newControlledRunner() *controlledRunner {
 	return &controlledRunner{started: make(chan string, 10), release: make(chan struct{}, 10)}
 }
 
-func (r *controlledRunner) Run(ctx context.Context, job *Job, stage func(string), progress func(ProgressUpdate), log func(string)) (RunResult, error) {
+func (r *controlledRunner) Run(ctx context.Context, job *Job, stage func(string), progress func(ProgressUpdate), disk func(DiskSpaceUpdate), log func(string)) (RunResult, error) {
 	r.mu.Lock()
 	r.running++
 	if r.running > r.maxRunning {

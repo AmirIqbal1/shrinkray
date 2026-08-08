@@ -56,6 +56,10 @@ type Job struct {
 	ETASeconds           *float64    `json:"eta_seconds"`
 	EncodeSpeed          float64     `json:"encode_speed"`
 	ETAIsEstimate        bool        `json:"eta_is_estimate"`
+	DiskAvailableBytes   uint64      `json:"disk_available_bytes,omitempty"`
+	DiskRequiredBytes    uint64      `json:"disk_required_bytes,omitempty"`
+	DiskSafetyReserve    uint64      `json:"disk_safety_reserve_bytes,omitempty"`
+	DiskSpaceWarning     bool        `json:"disk_space_warning,omitempty"`
 	Logs                 []string    `json:"logs"`
 	ResultSize           int64       `json:"result_size,omitempty"`
 	SavedPercent         float64     `json:"saved_percent,omitempty"`
@@ -70,19 +74,25 @@ type RunResult struct {
 }
 
 type JobRunner interface {
-	Run(context.Context, *Job, func(string), func(ProgressUpdate), func(string)) (RunResult, error)
+	Run(context.Context, *Job, func(string), func(ProgressUpdate), func(DiskSpaceUpdate), func(string)) (RunResult, error)
 }
 
 type CLIRunner struct {
-	roots        *RootRegistry
-	shrinkrayBin string
+	roots         *RootRegistry
+	shrinkrayBin  string
+	diskSpace     DiskSpaceChecker
+	probeDuration func(context.Context, string) (float64, error)
 }
 
 func NewCLIRunner(roots *RootRegistry, shrinkrayBin string) *CLIRunner {
-	return &CLIRunner{roots: roots, shrinkrayBin: shrinkrayBin}
+	return newCLIRunnerWithDiskSpace(roots, shrinkrayBin, FilesystemDiskSpaceChecker{})
 }
 
-func (r *CLIRunner) Run(ctx context.Context, job *Job, stage func(string), progress func(ProgressUpdate), logLine func(string)) (RunResult, error) {
+func newCLIRunnerWithDiskSpace(roots *RootRegistry, shrinkrayBin string, checker DiskSpaceChecker) *CLIRunner {
+	return &CLIRunner{roots: roots, shrinkrayBin: shrinkrayBin, diskSpace: checker, probeDuration: probeSourceDuration}
+}
+
+func (r *CLIRunner) Run(ctx context.Context, job *Job, stage func(string), progress func(ProgressUpdate), disk func(DiskSpaceUpdate), logLine func(string)) (RunResult, error) {
 	stage("Inspecting")
 	mediaRoot, err := r.roots.Get(job.RootID)
 	if err != nil {
@@ -101,8 +111,24 @@ func (r *CLIRunner) Run(ctx context.Context, job *Job, stage func(string), progr
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return RunResult{}, errors.New("could not inspect intended output")
 	}
+	targetBytes := TargetBytesFromMB(job.Settings.TargetMB)
+	checkDisk := func() (DiskSpaceStatus, error) {
+		status, checkErr := r.diskSpace.Check(filepath.Dir(output), targetBytes)
+		if checkErr == nil {
+			disk(diskSpaceUpdate(status))
+		}
+		return status, checkErr
+	}
+	status, err := checkDisk()
+	if err != nil {
+		return RunResult{}, errors.New("could not inspect free space on the destination filesystem")
+	}
+	if !status.Sufficient {
+		stage(stageInsufficientDisk)
+		return RunResult{}, insufficientDiskError(status)
+	}
 
-	duration, err := probeSourceDuration(ctx, source)
+	duration, err := r.probeDuration(ctx, source)
 	if err != nil {
 		if ctx.Err() != nil {
 			return RunResult{}, context.Canceled
@@ -123,6 +149,16 @@ func (r *CLIRunner) Run(ctx context.Context, job *Job, stage func(string), progr
 	}
 	defer reader.Close()
 	cmd.Stdout, cmd.Stderr = writer, writer
+	status, err = checkDisk()
+	if err != nil {
+		writer.Close()
+		return RunResult{}, errors.New("could not recheck free space on the destination filesystem")
+	}
+	if !status.Sufficient {
+		writer.Close()
+		stage(stageInsufficientDisk)
+		return RunResult{}, insufficientDiskError(status)
+	}
 	if err := cmd.Start(); err != nil {
 		writer.Close()
 		return RunResult{}, errors.New("could not start shrinkray")
@@ -147,11 +183,25 @@ func (r *CLIRunner) Run(ctx context.Context, job *Job, stage func(string), progr
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	progressParser := newProgressParser()
 	currentStage := "Inspecting"
+	criticalDisk := false
+	diskCheckWarningLogged := false
 	for scanner.Scan() {
 		line := r.roots.Redact(scanner.Text())
 		if record, complete, machineLine := progressParser.Consume(line); machineLine {
 			if complete {
 				progress(progressFromRecord(currentStage, duration, record))
+				status, checkErr := checkDisk()
+				if checkErr != nil {
+					if !diskCheckWarningLogged {
+						logLine("!!  Could not refresh destination disk space while encoding.")
+						diskCheckWarningLogged = true
+					}
+				} else if status.AvailableBytes < CriticalFreeSpaceBytes && !criticalDisk {
+					criticalDisk = true
+					currentStage = stageCriticalDisk
+					stage(stageCriticalDisk)
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+				}
 			}
 			continue
 		}
@@ -175,7 +225,13 @@ func (r *CLIRunner) Run(ctx context.Context, job *Job, stage func(string), progr
 	if scanner.Err() != nil {
 		return RunResult{}, errors.New("shrinkray produced an unreadable log line")
 	}
+	if criticalDisk {
+		return RunResult{}, criticalDiskError()
+	}
 	if waitErr != nil {
+		if currentStage == stageCriticalDisk {
+			return RunResult{}, criticalDiskError()
+		}
 		return RunResult{}, errors.New("shrinkray exited unsuccessfully")
 	}
 	info, err := os.Stat(output)
@@ -183,6 +239,14 @@ func (r *CLIRunner) Run(ctx context.Context, job *Job, stage func(string), progr
 		return RunResult{}, errors.New("shrinkray did not create the expected output")
 	}
 	return RunResult{Size: info.Size()}, nil
+}
+
+func insufficientDiskError(status DiskSpaceStatus) error {
+	return fmt.Errorf("Not enough free disk space. Available: %s. Required: %s. Shrinkray will not start this encode: %w", FormatBytes(status.AvailableBytes), FormatBytes(status.RequiredBytes), ErrInsufficientDiskSpace)
+}
+
+func criticalDiskError() error {
+	return fmt.Errorf("Critical low disk space. Encoding stopped before the destination filesystem was exhausted: %w", ErrCriticalDiskSpace)
 }
 
 func probeSourceDuration(ctx context.Context, source string) (float64, error) {
@@ -210,6 +274,10 @@ func stageFromLog(line string) string {
 		return stageAV1
 	case strings.Contains(lower, "validating output"):
 		return stageValidation
+	case strings.Contains(lower, "insufficient disk space"), strings.Contains(lower, "not enough free disk space"):
+		return stageInsufficientDisk
+	case strings.Contains(lower, "critical low disk space"):
+		return stageCriticalDisk
 	default:
 		return ""
 	}
@@ -220,6 +288,7 @@ type JobManager struct {
 	cond       *sync.Cond
 	roots      *RootRegistry
 	runner     JobRunner
+	diskSpace  DiskSpaceChecker
 	jobs       []*Job
 	pending    []*Job
 	reserved   map[string]bool
@@ -230,7 +299,11 @@ type JobManager struct {
 }
 
 func NewJobManager(roots *RootRegistry, runner JobRunner) *JobManager {
-	m := &JobManager{roots: roots, runner: runner, reserved: make(map[string]bool), workerDone: make(chan struct{})}
+	return newJobManagerWithDiskSpace(roots, runner, nil)
+}
+
+func newJobManagerWithDiskSpace(roots *RootRegistry, runner JobRunner, checker DiskSpaceChecker) *JobManager {
+	m := &JobManager{roots: roots, runner: runner, diskSpace: checker, reserved: make(map[string]bool), workerDone: make(chan struct{})}
 	m.cond = sync.NewCond(&m.mu)
 	go m.worker()
 	return m
@@ -292,6 +365,10 @@ func (m *JobManager) Submit(rootID, path, preset, container string, keepAllAudio
 	if err != nil {
 		return nil, errors.New("invalid intended output")
 	}
+	var initialDisk DiskSpaceStatus
+	if m.diskSpace != nil {
+		initialDisk, _ = m.diskSpace.Check(filepath.Dir(output), TargetBytesFromMB(target))
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -312,6 +389,8 @@ func (m *JobManager) Submit(rootID, path, preset, container string, keepAllAudio
 		Path: clean, Filename: filepathBase(clean), OutputPath: relOutput,
 		OriginalSize: info.Size(), Settings: JobSettings{Preset: preset, Quality: quality, Container: container, KeepAllAudio: keepAllAudio, TargetMB: target},
 		State: StateQueued, Stage: "Waiting", QueuedAt: time.Now().UTC(), Logs: []string{}, outputAbs: output,
+		DiskAvailableBytes: initialDisk.AvailableBytes, DiskRequiredBytes: initialDisk.RequiredBytes,
+		DiskSafetyReserve: initialDisk.ReserveBytes, DiskSpaceWarning: initialDisk.Warning,
 	}
 	m.jobs = append(m.jobs, job)
 	m.pending = append(m.pending, job)
@@ -408,6 +487,15 @@ func (m *JobManager) worker() {
 				job.ETAIsEstimate = update.ETAIsEstimate
 			}
 			m.mu.Unlock()
+		}, func(update DiskSpaceUpdate) {
+			m.mu.Lock()
+			if job.State == StateRunning {
+				job.DiskAvailableBytes = update.AvailableBytes
+				job.DiskRequiredBytes = update.RequiredBytes
+				job.DiskSafetyReserve = update.ReserveBytes
+				job.DiskSpaceWarning = update.Warning
+			}
+			m.mu.Unlock()
 		}, func(line string) {
 			m.mu.Lock()
 			job.Logs = append(job.Logs, line)
@@ -425,7 +513,15 @@ func (m *JobManager) worker() {
 		if errors.Is(err, context.Canceled) || wasCancelled {
 			job.State, job.Stage = StateCancelled, "Cancelled"
 		} else if err != nil {
-			job.State, job.Stage, job.Failure = StateFailed, "Failed", err.Error()
+			job.State, job.Failure = StateFailed, err.Error()
+			switch {
+			case errors.Is(err, ErrInsufficientDiskSpace):
+				job.Stage = stageInsufficientDisk
+			case errors.Is(err, ErrCriticalDiskSpace):
+				job.Stage = stageCriticalDisk
+			default:
+				job.Stage = "Failed"
+			}
 		} else {
 			job.State, job.Stage, job.ResultSize = StateCompleted, "Completed", result.Size
 			job.ProgressPercent, job.StageProgressPercent = 100, 100

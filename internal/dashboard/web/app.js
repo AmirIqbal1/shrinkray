@@ -265,6 +265,10 @@ function normalizeJob(job) {
     eta_seconds: job.eta_seconds === null || job.eta_seconds === undefined ? null : numberOrZero(job.eta_seconds),
     encode_speed: numberOrZero(job.encode_speed),
     eta_is_estimate: job.eta_is_estimate === true,
+    disk_available_bytes: numberOrZero(job.disk_available_bytes),
+    disk_required_bytes: numberOrZero(job.disk_required_bytes),
+    disk_safety_reserve_bytes: numberOrZero(job.disk_safety_reserve_bytes),
+    disk_space_warning: job.disk_space_warning === true,
     result_size: numberOrZero(job.result_size),
     saved_percent: numberOrZero(job.saved_percent),
     logs: Array.isArray(job.logs) ? job.logs : [],
@@ -307,6 +311,13 @@ function renderJob(job) {
   const showProgress = active || job.state === 'completed' || job.progress_percent > 0;
   const overallPercent = job.state === 'completed' ? 100 : Math.max(0, Math.min(99, job.progress_percent));
   const showPassProgress = job.stage.startsWith('HEVC pass');
+  const showDisk = job.disk_required_bytes > 0 && (
+    active || job.state === 'queued' || job.stage === 'Insufficient disk space' || job.stage === 'Critical low disk space'
+  );
+  const disk = showDisk ? `<div class="disk-space ${job.disk_space_warning ? 'warning' : ''}">
+    <span>${job.disk_space_warning ? '⚠ ' : ''}Disk free: <strong>${formatBytes(job.disk_available_bytes)}</strong></span>
+    <span>Required: <strong>${formatBytes(job.disk_required_bytes)}</strong></span>
+  </div>` : '';
   const progress = showProgress ? `<div class="job-progress">
       <div class="progress-labels"><strong>${formatPercent(overallPercent)} overall</strong>${showPassProgress ? `<span>${formatPercent(job.stage_progress_percent)} current pass</span>` : ''}</div>
       <div class="progress-track" role="progressbar" aria-label="Overall encoding progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${overallPercent.toFixed(1)}"><span style="width: ${overallPercent.toFixed(1)}%"></span></div>
@@ -337,7 +348,7 @@ function renderJob(job) {
         <div class="job-copy"><div class="job-title"><strong>${escapeHTML(job.filename)}</strong><span class="state-pill">${escapeHTML(job.state)}</span></div>
           <p>${escapeHTML(job.root_label)} · ${job.settings.target_mb.toLocaleString()} MB target · ${escapeHTML(jobSettings(job))} · queued ${escapeHTML(formatQueued(job.queued_at))}</p>
           <div class="stage"><span>${escapeHTML(job.stage)}</span><small>${formatElapsed(job.elapsed_seconds)}</small></div>
-          ${progress}${failure}${logs}
+          ${progress}${disk}${failure}${logs}
         </div>
         ${result}
         ${cancellable ? `<button class="cancel" data-cancel="${job.id}">Cancel</button>` : ''}

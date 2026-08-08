@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "${1-}" != "-f" ]; then
+  exec /usr/bin/stat "$@"
+fi
+
+counter_file="${SHRINKRAY_TEST_DISK_COUNTER:?counter file is required}"
+count=0
+if [ -f "$counter_file" ]; then
+  read -r count < "$counter_file"
+fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$counter_file"
+
+mode="${SHRINKRAY_TEST_DISK_MODE:-enough}"
+case "$mode:$count" in
+  insufficient:*|critical:2|critical:3|batch:1)
+    # About 391 MiB available on a roughly 381 GiB filesystem.
+    printf '100000 4096 100000000\n'
+    ;;
+  *)
+    # About 76 GiB available on the same filesystem.
+    printf '20000000 4096 100000000\n'
+    ;;
+esac

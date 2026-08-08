@@ -7,10 +7,12 @@ import (
 )
 
 const (
-	stageHEVCPass1  = "HEVC pass 1 of 2"
-	stageHEVCPass2  = "HEVC pass 2 of 2"
-	stageAV1        = "AV1 encoding"
-	stageValidation = "Validating output"
+	stageHEVCPass1        = "HEVC pass 1 of 2"
+	stageHEVCPass2        = "HEVC pass 2 of 2"
+	stageAV1              = "AV1 encoding"
+	stageValidation       = "Validating output"
+	stageInsufficientDisk = "Insufficient disk space"
+	stageCriticalDisk     = "Critical low disk space"
 )
 
 type ProgressUpdate struct {

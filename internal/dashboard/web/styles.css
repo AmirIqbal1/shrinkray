@@ -128,6 +128,10 @@ select { width: 100%; height: 38px; margin-top: 5px; padding: 0 10px; border: 1p
 .progress-stats small, .progress-stats strong { display: block; }
 .progress-stats small { color: var(--muted); font-size: 8px; font-weight: 700; text-transform: uppercase; letter-spacing: .35px; }
 .progress-stats strong { margin-top: 2px; overflow-wrap: anywhere; font-size: 10px; }
+.disk-space { width: fit-content; margin-top: 9px; padding: 6px 9px; display: flex; gap: 12px; border-radius: 6px; background: #f0f4f1; color: var(--muted); font-size: 9px; }
+.disk-space strong { color: var(--ink); }
+.disk-space.warning { background: #fff2d8; color: #8a5a12; }
+.disk-space.warning strong { color: #71470b; }
 .failure { color: var(--danger) !important; }
 .result { margin-left: auto; text-align: right; }
 .result strong, .result span { display: block; }
@@ -165,6 +169,7 @@ footer span { margin: 0 8px; color: var(--green); }
   .result { margin-left: 43px; text-align: left; }
   .progress-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; }
   .progress-labels { align-items: flex-start; flex-direction: column; gap: 2px; }
+  .disk-space { align-items: flex-start; flex-direction: column; gap: 2px; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; }

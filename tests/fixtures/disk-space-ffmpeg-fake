@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ " $* " == *" -encoders "* ]]; then
+  printf ' V..... libx265 fake HEVC encoder\n'
+  printf ' V..... libsvtav1 fake AV1 encoder\n'
+  exit 0
+fi
+
+marker="${SHRINKRAY_TEST_ENCODE_MARKER:?encode marker is required}"
+printf 'started\n' >> "$marker"
+output="${*: -1}"
+if [ "$output" != "/dev/null" ]; then
+  printf 'temporary encoded output\n' > "$output"
+fi
+printf 'out_time_us=1000000\nspeed=1.0x\nprogress=continue\n'
+if [ "${SHRINKRAY_TEST_DISK_MODE:-}" = "critical" ]; then
+  sleep 30
+fi
+printf 'out_time_us=10000000\nspeed=1.0x\nprogress=end\n'

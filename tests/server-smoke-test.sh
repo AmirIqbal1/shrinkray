@@ -125,6 +125,11 @@ if ! grep -q '"state":"queued"' "${TEMP_DIR}/created-movie.json" || ! grep -q '"
   printf 'server smoke test: submitted jobs were not queued\n' >&2
   exit 1
 fi
+if ! grep -Eq '"disk_available_bytes":[1-9]' "${TEMP_DIR}/created-movie.json" || ! grep -Eq '"disk_required_bytes":[1-9]' "${TEMP_DIR}/created-movie.json"; then
+  printf 'server smoke test: queued job did not expose destination disk information\n' >&2
+  sed -n '1,200p' "${TEMP_DIR}/created-movie.json" >&2
+  exit 1
+fi
 
 SAW_SEQUENTIAL=false
 SAW_PROGRESS=false

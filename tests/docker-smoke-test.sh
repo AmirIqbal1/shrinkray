@@ -115,4 +115,17 @@ printf '%s\n' "$HEALTH_JSON" |
   grep -Eq '"label"[[:space:]]*:[[:space:]]*"TV Shows"' ||
   fail "TV Shows root is absent from health response: ${HEALTH_JSON}"
 
+printf 'bind-mounted source\n' > "${MOVIES_DIR}/bind-space.mkv"
+JOB_JSON="$(curl --fail --silent --show-error \
+  --request POST \
+  --header 'Content-Type: application/json' \
+  --data '{"root_id":"movies","path":"bind-space.mkv","preset":"balanced","container":"mkv","keep_all_audio":false}' \
+  "http://127.0.0.1:${HOST_PORT}/api/jobs")"
+printf '%s\n' "$JOB_JSON" |
+  grep -Eq '"disk_available_bytes"[[:space:]]*:[[:space:]]*[1-9]' ||
+  fail "bind-mounted job did not report media filesystem space: ${JOB_JSON}"
+printf '%s\n' "$JOB_JSON" |
+  grep -Eq '"disk_required_bytes"[[:space:]]*:[[:space:]]*[1-9]' ||
+  fail "bind-mounted job did not report a disk requirement: ${JOB_JSON}"
+
 printf 'Docker smoke test passed on 127.0.0.1:%s.\n' "$HOST_PORT"
