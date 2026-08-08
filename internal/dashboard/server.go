@@ -64,7 +64,7 @@ func (s *Server) routes() http.Handler {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		if r.URL.Path != "/" && r.URL.Path != "/app.js" && r.URL.Path != "/styles.css" {
+		if r.URL.Path != "/" && r.URL.Path != "/app.js" && r.URL.Path != "/log-scroll.js" && r.URL.Path != "/styles.css" {
 			http.NotFound(w, r)
 			return
 		}

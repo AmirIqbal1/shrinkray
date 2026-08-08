@@ -6,8 +6,10 @@ const state = {
   jobs: [],
   expandedLogJobs: new Set(),
   knownLogJobs: new Set(),
+  logScrollJobs: new Map(),
 };
 const $ = (selector) => document.querySelector(selector);
+const { captureLogScroll, restoreLogScroll } = window.ShrinkrayLogScroll;
 
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes < 1) return '0 B';
@@ -282,6 +284,8 @@ function rememberLogPanelState(container) {
     state.knownLogJobs.add(id);
     if (details.open) state.expandedLogJobs.add(id);
     else state.expandedLogJobs.delete(id);
+    const log = details.querySelector('pre');
+    if (details.open && log) state.logScrollJobs.set(id, captureLogScroll(log));
   });
 }
 
@@ -292,23 +296,18 @@ function pruneLogPanelState() {
       if (!currentJobIDs.has(id)) storedIDs.delete(id);
     });
   });
+  state.logScrollJobs.forEach((_, id) => {
+    if (!currentJobIDs.has(id)) state.logScrollJobs.delete(id);
+  });
 }
 
-function renderJobs() {
-  const container = $('#jobs');
-  rememberLogPanelState(container);
-  pruneLogPanelState();
-  if (!state.jobs.length) {
-    container.innerHTML = '<div class="empty queue-empty">No jobs yet. Choose a movie above to get started.</div>';
-    return;
-  }
-  container.innerHTML = state.jobs.map((job) => {
-    const active = job.state === 'running';
-    const cancellable = active || job.state === 'queued';
-    const showProgress = active || job.state === 'completed' || job.progress_percent > 0;
-    const overallPercent = job.state === 'completed' ? 100 : Math.max(0, Math.min(99, job.progress_percent));
-    const showPassProgress = job.stage.startsWith('HEVC pass');
-    const progress = showProgress ? `<div class="job-progress">
+function renderJob(job) {
+  const active = job.state === 'running';
+  const cancellable = active || job.state === 'queued';
+  const showProgress = active || job.state === 'completed' || job.progress_percent > 0;
+  const overallPercent = job.state === 'completed' ? 100 : Math.max(0, Math.min(99, job.progress_percent));
+  const showPassProgress = job.stage.startsWith('HEVC pass');
+  const progress = showProgress ? `<div class="job-progress">
       <div class="progress-labels"><strong>${formatPercent(overallPercent)} overall</strong>${showPassProgress ? `<span>${formatPercent(job.stage_progress_percent)} current pass</span>` : ''}</div>
       <div class="progress-track" role="progressbar" aria-label="Overall encoding progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${overallPercent.toFixed(1)}"><span style="width: ${overallPercent.toFixed(1)}%"></span></div>
       <div class="progress-stats">
@@ -318,21 +317,21 @@ function renderJobs() {
         ${active && job.eta_seconds !== null && job.eta_seconds > 0 ? `<span><small>${job.eta_is_estimate ? 'Estimated ETA' : 'ETA'}</small><strong>${formatDuration(job.eta_seconds)}</strong></span>` : ''}
       </div>
     </div>` : '';
-    const result = job.state === 'completed'
-      ? `<div class="result"><strong>100% · Completed</strong><span>${formatBytes(job.result_size)} · ${job.saved_percent >= 0 ? `${job.saved_percent.toFixed(1)}% saved` : 'output is larger'}</span></div>`
-      : '';
-    const failure = job.failure ? `<p class="failure">${escapeHTML(job.failure)}</p>` : '';
-    const logLines = Array.isArray(job.logs) ? job.logs : [];
-    const hasStoredLogState = state.knownLogJobs.has(job.id);
-    const logsOpen = hasStoredLogState ? state.expandedLogJobs.has(job.id) : active;
-    if (logLines.length) {
-      state.knownLogJobs.add(job.id);
-      if (logsOpen) state.expandedLogJobs.add(job.id);
-    }
-    const logs = logLines.length
-      ? `<details data-job-logs="${escapeHTML(job.id)}" ${logsOpen ? 'open' : ''}><summary>Latest log messages</summary><pre>${logLines.map(escapeHTML).join('\n')}</pre></details>`
-      : '';
-    return `<article class="job ${job.state}">
+  const result = job.state === 'completed'
+    ? `<div class="result"><strong>100% · Completed</strong><span>${formatBytes(job.result_size)} · ${job.saved_percent >= 0 ? `${job.saved_percent.toFixed(1)}% saved` : 'output is larger'}</span></div>`
+    : '';
+  const failure = job.failure ? `<p class="failure">${escapeHTML(job.failure)}</p>` : '';
+  const logLines = Array.isArray(job.logs) ? job.logs : [];
+  const hasStoredLogState = state.knownLogJobs.has(job.id);
+  const logsOpen = hasStoredLogState ? state.expandedLogJobs.has(job.id) : active;
+  if (logLines.length) {
+    state.knownLogJobs.add(job.id);
+    if (logsOpen) state.expandedLogJobs.add(job.id);
+  }
+  const logs = logLines.length
+    ? `<details data-job-logs="${escapeHTML(job.id)}" ${logsOpen ? 'open' : ''}><summary>Latest log messages</summary><pre>${logLines.map(escapeHTML).join('\n')}</pre></details>`
+    : '';
+  return `<article class="job ${job.state}" data-job-id="${escapeHTML(job.id)}">
       <div class="job-main">
         <div class="job-state-icon">${active ? '<i class="spinner"></i>' : job.state === 'completed' ? '✓' : job.state === 'failed' ? '!' : job.state === 'cancelled' ? '×' : '…'}</div>
         <div class="job-copy"><div class="job-title"><strong>${escapeHTML(job.filename)}</strong><span class="state-pill">${escapeHTML(job.state)}</span></div>
@@ -344,7 +343,65 @@ function renderJobs() {
         ${cancellable ? `<button class="cancel" data-cancel="${job.id}">Cancel</button>` : ''}
       </div>
     </article>`;
-  }).join('');
+}
+
+function createJobCard(job) {
+  const template = document.createElement('template');
+  template.innerHTML = renderJob(job).trim();
+  return template.content.firstElementChild;
+}
+
+function reconcileLogPanel(previousCard, nextCard, restorations) {
+  const previousDetails = previousCard?.querySelector('details[data-job-logs]');
+  const nextDetails = nextCard.querySelector('details[data-job-logs]');
+  if (!nextDetails) return;
+
+  const nextLog = nextDetails.querySelector('pre');
+  const id = nextDetails.dataset.jobLogs;
+  if (!previousDetails) {
+    restorations.push({ id, details: nextDetails, log: nextLog, snapshot: state.logScrollJobs.get(id) || null });
+    return;
+  }
+
+  const previousLog = previousDetails.querySelector('pre');
+  if (!previousLog || !nextLog) return;
+  const nextText = nextLog.textContent;
+  const contentChanged = previousLog.textContent !== nextText;
+  const snapshot = contentChanged
+    ? (previousDetails.open ? captureLogScroll(previousLog) : state.logScrollJobs.get(id) || captureLogScroll(previousLog))
+    : null;
+  if (contentChanged) previousLog.textContent = nextText;
+  nextDetails.replaceWith(previousDetails);
+  if (contentChanged) restorations.push({ id, details: previousDetails, log: previousLog, snapshot });
+}
+
+function renderJobs() {
+  const container = $('#jobs');
+  rememberLogPanelState(container);
+  pruneLogPanelState();
+  if (!state.jobs.length) {
+    if (!container.querySelector('.queue-empty')) {
+      container.innerHTML = '<div class="empty queue-empty">No jobs yet. Choose a movie above to get started.</div>';
+    }
+    return;
+  }
+
+  const previousCards = new Map(Array.from(container.querySelectorAll('.job[data-job-id]'), (card) => [card.dataset.jobId, card]));
+  const restorations = [];
+  const nextCards = state.jobs.map((job) => {
+    const card = createJobCard(job);
+    reconcileLogPanel(previousCards.get(job.id), card, restorations);
+    return card;
+  });
+  container.replaceChildren(...nextCards);
+  restorations.forEach(({ id, details, log, snapshot }) => {
+    if (details.open) {
+      restoreLogScroll(log, snapshot, true);
+      state.logScrollJobs.set(id, captureLogScroll(log));
+    } else if (!state.logScrollJobs.has(id)) {
+      state.logScrollJobs.set(id, snapshot || { followingBottom: true, distanceFromBottom: 0 });
+    }
+  });
 }
 
 async function loadJobs() {
@@ -393,8 +450,23 @@ $('#jobs').addEventListener('toggle', (event) => {
   if (!details) return;
   const id = details.dataset.jobLogs;
   state.knownLogJobs.add(id);
-  if (details.open) state.expandedLogJobs.add(id);
-  else state.expandedLogJobs.delete(id);
+  if (details.open) {
+    state.expandedLogJobs.add(id);
+    requestAnimationFrame(() => {
+      const log = details.querySelector('pre');
+      if (!log) return;
+      restoreLogScroll(log, state.logScrollJobs.get(id) || null, true);
+      state.logScrollJobs.set(id, captureLogScroll(log));
+    });
+  } else {
+    state.expandedLogJobs.delete(id);
+  }
+}, true);
+$('#jobs').addEventListener('scroll', (event) => {
+  const log = event.target.closest('details[data-job-logs] > pre');
+  if (!log) return;
+  const details = log.closest('details[data-job-logs]');
+  state.logScrollJobs.set(details.dataset.jobLogs, captureLogScroll(log));
 }, true);
 
 async function initialize() {

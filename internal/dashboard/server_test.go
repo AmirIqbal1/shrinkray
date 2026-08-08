@@ -102,3 +102,21 @@ func TestJobSubmissionRequiresRootID(t *testing.T) {
 		t.Fatalf("missing root ID status = %d; want %d", response.Code, http.StatusBadRequest)
 	}
 }
+
+func TestDashboardServesLogScrollHelpersBeforeApplication(t *testing.T) {
+	server, _, _ := makeTwoRootServer(t)
+	index := requestServer(t, server, http.MethodGet, "/", nil)
+	if index.Code != http.StatusOK {
+		t.Fatalf("dashboard index status = %d; want %d", index.Code, http.StatusOK)
+	}
+	logScrollIndex := strings.Index(index.Body.String(), `src="/log-scroll.js"`)
+	appIndex := strings.Index(index.Body.String(), `src="/app.js"`)
+	if logScrollIndex < 0 || appIndex < 0 || logScrollIndex > appIndex {
+		t.Fatalf("dashboard scripts are missing or out of order: %s", index.Body.String())
+	}
+
+	helpers := requestServer(t, server, http.MethodGet, "/log-scroll.js", nil)
+	if helpers.Code != http.StatusOK || !strings.Contains(helpers.Body.String(), "captureLogScroll") {
+		t.Fatalf("log scroll helper response = %d, %s", helpers.Code, helpers.Body.String())
+	}
+}
