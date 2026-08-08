@@ -157,9 +157,9 @@ collect_disk_space() {
       if (reserve < minimum_reserve) reserve = minimum_reserve
       required = target + allowance + reserve
       if (required > max) required = max
-      printf "%.0f %.0f %.0f %.0f\n", available, capacity, reserve, required
+      printf "%.0f %.0f %.0f\n", available, reserve, required
     }')" || return 1
-  read -r DISK_AVAILABLE_BYTES DISK_CAPACITY_BYTES DISK_RESERVE_BYTES DISK_REQUIRED_BYTES <<< "$values"
+  read -r DISK_AVAILABLE_BYTES DISK_RESERVE_BYTES DISK_REQUIRED_BYTES <<< "$values"
   [[ "$DISK_AVAILABLE_BYTES" =~ ^[0-9]+$ && "$DISK_REQUIRED_BYTES" =~ ^[0-9]+$ ]] || return 1
 }
 
