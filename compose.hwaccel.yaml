@@ -1,0 +1,6 @@
+services:
+  shrinkray:
+    devices:
+      - "${SHRINKRAY_DRM_RENDER_DEVICE:?set SHRINKRAY_DRM_RENDER_DEVICE}:${SHRINKRAY_DRM_RENDER_DEVICE}:rwm"
+    group_add:
+      - "${SHRINKRAY_DRM_RENDER_GID:?set SHRINKRAY_DRM_RENDER_GID}"

@@ -77,3 +77,4 @@ grep -q '^progress=end$' "$MACHINE_PROGRESS_LOG" || {
 printf 'Machine-progress smoke test passed.\n'
 
 bash "${ROOT_DIR}/tests/disk-space-test.sh"
+bash "${ROOT_DIR}/tests/hardware-acceleration-test.sh"

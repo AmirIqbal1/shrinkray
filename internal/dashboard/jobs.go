@@ -28,11 +28,12 @@ const (
 )
 
 type JobSettings struct {
-	Preset       string `json:"preset"`
-	Quality      string `json:"quality"`
-	Container    string `json:"container"`
-	KeepAllAudio bool   `json:"keep_all_audio"`
-	TargetMB     int64  `json:"target_mb"`
+	Preset           string `json:"preset"`
+	Quality          string `json:"quality"`
+	Container        string `json:"container"`
+	KeepAllAudio     bool   `json:"keep_all_audio"`
+	TargetMB         int64  `json:"target_mb"`
+	RequestedEncoder string `json:"requested_encoder,omitempty"`
 }
 
 type Job struct {
@@ -65,6 +66,7 @@ type Job struct {
 	ResultSize           int64       `json:"result_size,omitempty"`
 	SavedPercent         float64     `json:"saved_percent,omitempty"`
 	Failure              string      `json:"failure,omitempty"`
+	ActualEncoder        string      `json:"actual_encoder,omitempty"`
 
 	cancel              context.CancelFunc
 	outputAbs           string
@@ -139,7 +141,11 @@ func (r *CLIRunner) Run(ctx context.Context, job *Job, stage func(string), progr
 	}
 	progress(ProgressUpdate{DurationSeconds: duration})
 
-	args := []string{source, "--size", strconv.FormatInt(job.Settings.TargetMB, 10), "--quality", job.Settings.Quality, "--container", job.Settings.Container, "--machine-progress"}
+	requestedEncoder := job.Settings.RequestedEncoder
+	if requestedEncoder == "" {
+		requestedEncoder = "software"
+	}
+	args := []string{source, "--size", strconv.FormatInt(job.Settings.TargetMB, 10), "--quality", job.Settings.Quality, "--container", job.Settings.Container, "--encoder", requestedEncoder, "--machine-progress"}
 	if job.Settings.KeepAllAudio {
 		args = append(args, "--keep-all-audio")
 	}
@@ -274,6 +280,12 @@ func stageFromLog(line string) string {
 		return stageHEVCPass2
 	case strings.Contains(lower, "encoding with av1"):
 		return stageAV1
+	case strings.Contains(lower, "hevc hardware") && strings.Contains(lower, "intel qsv"):
+		return stageHardwareQSV
+	case strings.Contains(lower, "hevc hardware") && strings.Contains(lower, "vaapi"):
+		return stageHardwareVAAPI
+	case strings.Contains(lower, "hevc hardware") && strings.Contains(lower, "nvidia nvenc"):
+		return stageHardwareNVENC
 	case strings.Contains(lower, "validating output"):
 		return stageValidation
 	case strings.Contains(lower, "insufficient disk space"), strings.Contains(lower, "not enough free disk space"):
@@ -357,7 +369,14 @@ func CalculatePresetMB(size int64, preset string, exact int64) (int64, string, e
 	return mb, quality, nil
 }
 
-func (m *JobManager) Submit(rootID, path, preset, container string, keepAllAudio bool, exactMB int64) (*Job, error) {
+func (m *JobManager) Submit(rootID, path, preset, container string, keepAllAudio bool, exactMB int64, requestedEncoders ...string) (*Job, error) {
+	requestedEncoder := "auto"
+	if len(requestedEncoders) > 0 && requestedEncoders[0] != "" {
+		requestedEncoder = requestedEncoders[0]
+	}
+	if !validRequestedEncoder(requestedEncoder) {
+		return nil, errors.New("encoder must be auto, software, qsv, vaapi, or nvenc")
+	}
 	mediaRoot, err := m.roots.Get(rootID)
 	if err != nil {
 		return nil, ErrUnknownRoot
@@ -416,7 +435,7 @@ func (m *JobManager) Submit(rootID, path, preset, container string, keepAllAudio
 	job := &Job{
 		ID: strconv.FormatUint(m.nextID, 10), RootID: mediaRoot.ID, RootLabel: mediaRoot.Label,
 		Path: clean, Filename: filepathBase(clean), OutputPath: relOutput,
-		OriginalSize: info.Size(), Settings: JobSettings{Preset: preset, Quality: quality, Container: container, KeepAllAudio: keepAllAudio, TargetMB: target},
+		OriginalSize: info.Size(), Settings: JobSettings{Preset: preset, Quality: quality, Container: container, KeepAllAudio: keepAllAudio, TargetMB: target, RequestedEncoder: requestedEncoder},
 		State: StateQueued, Stage: "Waiting", QueuedAt: time.Now().UTC(), Logs: []string{}, outputAbs: output,
 		DiskAvailableBytes: initialDisk.AvailableBytes, DiskRequiredBytes: initialDisk.RequiredBytes,
 		DiskSafetyReserve: initialDisk.ReserveBytes, DiskSpaceWarning: initialDisk.Warning,
@@ -590,6 +609,9 @@ func (m *JobManager) worker() {
 			if job.State == StateRunning {
 				previous := job.Stage
 				updateJobStage(job, stage)
+				if actual := actualEncoderFromStage(stage); actual != "" {
+					job.ActualEncoder = actual
+				}
 				if previous != job.Stage {
 					job.lastProgressPersist = time.Now()
 					m.markPersistenceDirtyLocked()
@@ -708,7 +730,7 @@ func updateJobStage(job *Job, stage string) {
 		return
 	}
 	switch stage {
-	case stageHEVCPass1, stageAV1:
+	case stageHEVCPass1, stageAV1, stageHardwareQSV, stageHardwareVAAPI, stageHardwareNVENC:
 		job.ProgressPercent = 0
 		job.StageProgressPercent = 0
 		job.ProcessedSeconds = 0
@@ -723,6 +745,21 @@ func updateJobStage(job *Job, stage string) {
 	case stageValidation:
 		job.ProgressPercent = 99
 		job.ETASeconds, job.ETAIsEstimate = nil, false
+	}
+}
+
+func actualEncoderFromStage(stage string) string {
+	switch stage {
+	case stageHEVCPass1, stageHEVCPass2:
+		return "software"
+	case stageHardwareQSV:
+		return "qsv"
+	case stageHardwareVAAPI:
+		return "vaapi"
+	case stageHardwareNVENC:
+		return "nvenc"
+	default:
+		return ""
 	}
 }
 
@@ -772,5 +809,9 @@ func (s JobSettings) String() string {
 	if s.KeepAllAudio {
 		audio = "all audio tracks"
 	}
-	return fmt.Sprintf("%s, %s, %s, %s", s.Preset, s.Quality, strings.ToUpper(s.Container), audio)
+	encoder := s.RequestedEncoder
+	if encoder == "" {
+		encoder = "software"
+	}
+	return fmt.Sprintf("%s, %s, %s, %s, encoder %s", s.Preset, s.Quality, strings.ToUpper(s.Container), audio, encoder)
 }

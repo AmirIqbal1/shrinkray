@@ -30,6 +30,8 @@ fail() {
 command -v docker >/dev/null 2>&1 || fail 'docker is required'
 command -v curl >/dev/null 2>&1 || fail 'curl is required'
 
+bash "${REPO_ROOT}/tests/hardware-compose-test.sh"
+
 mkdir -p "$MOVIES_DIR" "$TV_DIR" "$STATE_DIR"
 
 printf 'Building Docker image...\n'

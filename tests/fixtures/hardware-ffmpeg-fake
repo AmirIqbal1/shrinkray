@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+has_name() {
+  case ",${1-}," in *",$2,"*) return 0 ;; *) return 1 ;; esac
+}
+
+if [[ " $* " == *" -encoders "* ]]; then
+  printf ' V..... libx265 software HEVC\n'
+  printf ' V..... libsvtav1 software AV1\n'
+  has_name "${SHRINKRAY_TEST_LISTED:-}" qsv && printf ' V..... hevc_qsv Intel QSV\n'
+  has_name "${SHRINKRAY_TEST_LISTED:-}" vaapi && printf ' V..... hevc_vaapi VAAPI\n'
+  has_name "${SHRINKRAY_TEST_LISTED:-}" nvenc && printf ' V..... hevc_nvenc NVENC\n'
+  exit 0
+fi
+if [[ " $* " == *" -hwaccels "* ]]; then
+  printf 'Hardware acceleration methods:\n'
+  has_name "${SHRINKRAY_TEST_LISTED:-}" qsv && printf 'qsv\n'
+  has_name "${SHRINKRAY_TEST_LISTED:-}" vaapi && printf 'vaapi\n'
+  has_name "${SHRINKRAY_TEST_LISTED:-}" nvenc && printf 'cuda\n'
+  exit 0
+fi
+
+backend=software
+device=""
+previous=""
+for argument in "$@"; do
+  case "$previous:$argument" in
+    -c:v:hevc_qsv) backend=qsv ;;
+    -c:v:hevc_vaapi) backend=vaapi ;;
+    -c:v:hevc_nvenc) backend=nvenc ;;
+    -c:v:libx265) backend=software ;;
+    -vaapi_device:*) device="$argument" ;;
+  esac
+  case "$argument" in qsv=shrinkray_hw:*) device="${argument#qsv=shrinkray_hw:}" ;; esac
+  previous="$argument"
+done
+output="${*: -1}"
+
+if [[ " $* " == *" color=size=128x72:rate=5:duration=0.4 "* ]]; then
+  has_name "${SHRINKRAY_TEST_WORKING:-}" "$backend" || exit 1
+  if [ "$backend" = qsv ] && [ -n "${SHRINKRAY_TEST_QSV_DEVICE:-}" ] && [ "$device" != "$SHRINKRAY_TEST_QSV_DEVICE" ]; then exit 1; fi
+  if [ "$backend" = vaapi ] && [ -n "${SHRINKRAY_TEST_VAAPI_DEVICE:-}" ] && [ "$device" != "$SHRINKRAY_TEST_VAAPI_DEVICE" ]; then exit 1; fi
+  printf 'probe output\n' >"$output"
+  exit 0
+fi
+
+printf '%s\n' "$backend $*" >>"${SHRINKRAY_TEST_COMMAND_LOG:?command log required}"
+if [ "$backend" != software ] && [ "${SHRINKRAY_TEST_FAIL_HARDWARE:-false}" = true ]; then
+  printf 'partial hardware output\n' >"$output"
+  exit 1
+fi
+if [ "$backend" = software ] && [ -n "${SHRINKRAY_TEST_PART_PATH:-}" ] && [ -e "$SHRINKRAY_TEST_PART_PATH" ]; then
+  printf 'part leaked into software fallback\n' >"${SHRINKRAY_TEST_FALLBACK_LEAK:?fallback leak marker required}"
+fi
+if [ "$output" != /dev/null ]; then
+  printf 'encoded output\n' >"$output"
+fi
+printf 'out_time_us=5000000\nspeed=2.0x\nprogress=continue\n'
+printf 'out_time_us=10000000\nspeed=2.0x\nprogress=end\n'

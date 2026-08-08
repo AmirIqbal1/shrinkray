@@ -10,6 +10,7 @@ VERSION="1.2.0"
 TARGET_MB=500
 QUALITY="good"
 CODEC="auto"
+ENCODER="auto"
 CONTAINER="mkv"
 KEEP_ALL_AUDIO=false
 OUTPUT=""
@@ -26,6 +27,7 @@ ACTIVE_WORKDIR=""
 ACTIVE_ENCODER_PID=""
 ACTIVE_MONITOR_PID=""
 ACTIVE_OUTPUT_DIR=""
+ACTIVE_PROBE_DIR=""
 CRITICAL_DISK_TRIGGERED=false
 ENCODER_WORKING_ALLOWANCE_BYTES=$((512 * 1024 * 1024))
 MINIMUM_SAFETY_RESERVE_BYTES=$((2 * 1024 * 1024 * 1024))
@@ -51,6 +53,7 @@ OPTIONS:
   --quality <level>   fast | good | best                    (default: good)
   --codec <name>      auto | hevc | av1                     (default: auto)
                        auto uses HEVC; AV1 must be requested explicitly
+  --encoder <name>    auto | software | qsv | vaapi | nvenc (default: auto)
   --container <fmt>   mkv | mp4                              (default: mkv)
   --keep-all-audio    Keep every audio track (default: first track only)
   --output <path>     Output path (default: <name>.shrunk.<container>)
@@ -69,6 +72,7 @@ EXAMPLES:
   shrinkray movie.mkv --size 700 --quality best
   shrinkray --batch ~/Movies --recursive --size 500
   shrinkray doctor
+  shrinkray capabilities --json
 EOF
 }
 
@@ -87,11 +91,15 @@ cleanup_active() {
   if [ -n "$ACTIVE_WORKDIR" ] && [ -d "$ACTIVE_WORKDIR" ]; then
     rm -rf -- "$ACTIVE_WORKDIR"
   fi
+  if [ -n "$ACTIVE_PROBE_DIR" ] && [ -d "$ACTIVE_PROBE_DIR" ]; then
+    rm -rf -- "$ACTIVE_PROBE_DIR"
+  fi
   ACTIVE_TEMP=""
   ACTIVE_WORKDIR=""
   ACTIVE_ENCODER_PID=""
   ACTIVE_MONITOR_PID=""
   ACTIVE_OUTPUT_DIR=""
+  ACTIVE_PROBE_DIR=""
 }
 
 handle_signal() {
@@ -257,6 +265,112 @@ has_encoder() {
   [[ "$encoder_list" == *"$encoder"* ]]
 }
 
+has_hwaccel() {
+  local hwaccel_list="$1"
+  local hwaccel="$2"
+  printf '%s\n' "$hwaccel_list" | grep -Fxq "$hwaccel"
+}
+
+json_string() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
+}
+
+probe_hardware_encoder() {
+  local backend="$1"
+  local device="${2-}"
+  local output status probe_ok=false
+  local -a command
+  ACTIVE_PROBE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/shrinkray-hwprobe.XXXXXX")" || return 1
+  output="${ACTIVE_PROBE_DIR}/probe.mkv"
+  command=(ffmpeg -y -hide_banner -loglevel error)
+  case "$backend" in
+    qsv)
+      command+=(-init_hw_device "qsv=shrinkray_hw:${device}" -filter_hw_device shrinkray_hw
+        -f lavfi -i "color=size=128x72:rate=5:duration=0.4"
+        -vf "format=nv12,hwupload" -frames:v 2 -an -c:v hevc_qsv -b:v 500k -f matroska "$output")
+      ;;
+    vaapi)
+      command+=(-vaapi_device "$device" -f lavfi -i "color=size=128x72:rate=5:duration=0.4"
+        -vf "format=nv12,hwupload" -frames:v 2 -an -c:v hevc_vaapi -b:v 500k -f matroska "$output")
+      ;;
+    nvenc)
+      command+=(-f lavfi -i "color=size=128x72:rate=5:duration=0.4"
+        -frames:v 2 -an -c:v hevc_nvenc -b:v 500k -f matroska "$output")
+      ;;
+    *) rm -rf -- "$ACTIVE_PROBE_DIR"; ACTIVE_PROBE_DIR=""; return 1 ;;
+  esac
+  if command -v timeout >/dev/null 2>&1; then
+    if timeout --signal=TERM --kill-after=2s 8s "${command[@]}" >/dev/null 2>&1; then status=0; else status=$?; fi
+  else
+    if "${command[@]}" >/dev/null 2>&1; then status=0; else status=$?; fi
+  fi
+  [ "$status" -eq 0 ] && [ -s "$output" ] && probe_ok=true
+  rm -rf -- "$ACTIVE_PROBE_DIR"
+  ACTIVE_PROBE_DIR=""
+  [ "$probe_ok" = true ]
+}
+
+detect_hardware_capabilities() {
+  local device dri_dir
+  local -a render_devices=()
+  ENCODER_LIST="$(ffmpeg -hide_banner -encoders 2>/dev/null || true)"
+  HWACCEL_LIST="$(ffmpeg -hide_banner -hwaccels 2>/dev/null | sed '1d' | sed '/^[[:space:]]*$/d' || true)"
+  CAP_SOFTWARE=false
+  CAP_QSV=false
+  CAP_VAAPI=false
+  CAP_NVENC=false
+  QSV_DEVICE=""
+  VAAPI_DEVICE=""
+  AUTO_ENCODER=""
+  has_encoder "$ENCODER_LIST" libx265 && CAP_SOFTWARE=true
+  dri_dir="${SHRINKRAY_DRI_DIR:-/dev/dri}"
+  shopt -s nullglob
+  for device in "$dri_dir"/renderD*; do
+    [ -c "$device" ] || [ "${SHRINKRAY_ALLOW_REGULAR_RENDER_DEVICES:-0}" = 1 ] || continue
+    if [ ! -r "$device" ] || [ ! -w "$device" ]; then
+      continue
+    fi
+    render_devices+=("$device")
+  done
+  shopt -u nullglob
+  if has_encoder "$ENCODER_LIST" hevc_qsv && has_hwaccel "$HWACCEL_LIST" qsv; then
+    for device in "${render_devices[@]}"; do
+      if probe_hardware_encoder qsv "$device"; then
+        CAP_QSV=true
+        QSV_DEVICE="$device"
+        break
+      fi
+    done
+  fi
+  if has_encoder "$ENCODER_LIST" hevc_vaapi && has_hwaccel "$HWACCEL_LIST" vaapi; then
+    for device in "${render_devices[@]}"; do
+      if probe_hardware_encoder vaapi "$device"; then
+        CAP_VAAPI=true
+        VAAPI_DEVICE="$device"
+        break
+      fi
+    done
+  fi
+  if has_encoder "$ENCODER_LIST" hevc_nvenc && has_hwaccel "$HWACCEL_LIST" cuda && probe_hardware_encoder nvenc; then
+    CAP_NVENC=true
+  fi
+  if [ "$CAP_QSV" = true ]; then AUTO_ENCODER=qsv
+  elif [ "$CAP_VAAPI" = true ]; then AUTO_ENCODER=vaapi
+  elif [ "$CAP_NVENC" = true ]; then AUTO_ENCODER=nvenc
+  elif [ "$CAP_SOFTWARE" = true ]; then AUTO_ENCODER=software
+  fi
+}
+
+print_capabilities_json() {
+  printf '{"encoders":{"software":%s,"qsv":%s,"vaapi":%s,"nvenc":%s},' \
+    "$CAP_SOFTWARE" "$CAP_QSV" "$CAP_VAAPI" "$CAP_NVENC"
+  printf '"auto_selected":%s,' "$(json_string "$AUTO_ENCODER")"
+  printf '"devices":{"qsv":%s,"vaapi":%s}}\n' "$(json_string "$QSV_DEVICE")" "$(json_string "$VAAPI_DEVICE")"
+}
+
 doctor() {
   local self_path ffmpeg_line ffprobe_line encoder_list
   if command -v realpath >/dev/null 2>&1; then
@@ -288,6 +402,24 @@ doctor() {
     printf '  HEVC/libx265: unavailable\n'
     printf '  AV1/libsvtav1: unavailable\n'
   fi
+
+  printf '\nHardware acceleration\n'
+  if command -v ffmpeg >/dev/null 2>&1; then
+    detect_hardware_capabilities
+  else
+    CAP_SOFTWARE=false CAP_QSV=false CAP_VAAPI=false CAP_NVENC=false
+    QSV_DEVICE="" VAAPI_DEVICE="" AUTO_ENCODER=""
+  fi
+  printf '  Intel QSV:\n'
+  printf '    device: %s\n' "${QSV_DEVICE:-not detected}"
+  printf '    HEVC encode: %s\n' "$([ "$CAP_QSV" = true ] && printf available || printf unavailable)"
+  printf '  VAAPI:\n'
+  printf '    device: %s\n' "${VAAPI_DEVICE:-not detected}"
+  printf '    HEVC encode: %s\n' "$([ "$CAP_VAAPI" = true ] && printf available || printf unavailable)"
+  printf '  NVIDIA NVENC:\n'
+  printf '    HEVC encode: %s\n' "$([ "$CAP_NVENC" = true ] && printf available || printf unavailable)"
+  printf '  Selected auto backend:\n'
+  printf '    %s\n' "${AUTO_ENCODER:-unavailable}"
 
   if command -v ffprobe >/dev/null 2>&1; then
     ffprobe_line="$(ffprobe -version 2>/dev/null | sed -n '1p')"
@@ -562,7 +694,7 @@ validate_output() {
     >/dev/null 2>&1
 }
 
-run_hevc_encode() {
+run_software_hevc_encode() {
   local input="$1"
   local temp_output="$2"
   local video_kbps="$3"
@@ -591,6 +723,56 @@ run_hevc_encode() {
     warn "HEVC pass 2 failed for $(basename -- "$input")."
     return 1
   fi
+}
+
+encoder_display_name() {
+  case "$1" in
+    software) printf 'Software x265\n' ;;
+    qsv) printf 'Intel QSV\n' ;;
+    vaapi) printf 'VAAPI\n' ;;
+    nvenc) printf 'NVIDIA NVENC\n' ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+run_hardware_hevc_encode() {
+  local backend="$1"
+  local input="$2"
+  local temp_output="$3"
+  local video_kbps="$4"
+  shift 4
+  local -a mapping_args=("$@") device_args encoder_args filter_args
+  local label
+  label="$(encoder_display_name "$backend")"
+  device_args=()
+  encoder_args=()
+  filter_args=()
+  case "$backend" in
+    qsv)
+      device_args=(-init_hw_device "qsv=shrinkray_hw:${QSV_DEVICE}" -filter_hw_device shrinkray_hw)
+      filter_args=(-vf "format=nv12,hwupload")
+      encoder_args=(-c:v hevc_qsv -preset medium -b:v "${video_kbps}k")
+      ;;
+    vaapi)
+      device_args=(-vaapi_device "$VAAPI_DEVICE")
+      filter_args=(-vf "format=nv12,hwupload")
+      encoder_args=(-c:v hevc_vaapi -rc_mode VBR -b:v "${video_kbps}k")
+      ;;
+    nvenc)
+      encoder_args=(-c:v hevc_nvenc -preset p5 -rc vbr -b:v "${video_kbps}k")
+      ;;
+    *) return 1 ;;
+  esac
+  say "Encoding with HEVC hardware — ${label}..."
+  say "Encoder backend: ${backend}"
+  run_ffmpeg_with_disk_guard ffmpeg -y -hide_banner -loglevel warning "${FFMPEG_PROGRESS_ARGS[@]}" \
+    "${device_args[@]}" -i "$input" "${mapping_args[@]}" \
+    -map_metadata 0 -map_chapters 0 \
+    "${filter_args[@]}" \
+    "${encoder_args[@]}" \
+    -c:a aac -b:a "${AUDIO_KBPS}k" \
+    "${SUBTITLE_CODEC_ARGS[@]}" \
+    -f "$OUTPUT_FORMAT" "$temp_output"
 }
 
 run_av1_encode() {
@@ -657,6 +839,9 @@ process_file() {
   say ""
   say "File:    $(basename -- "$input")"
   say "Codec:   $codec"
+  if [ "$codec" = hevc ]; then
+    say "Encoder: $(encoder_display_name "$SELECTED_ENCODER")"
+  fi
   say "Quality: $QUALITY"
   say "Target:  ${target_mb} MB (currently ${orig_mb} MB)"
   say "Output:  $output"
@@ -723,9 +908,30 @@ process_file() {
   fi
 
   if [ "$codec" = "hevc" ]; then
-    if ! run_hevc_encode "$input" "$ACTIVE_TEMP" "$video_kbps" "${mapping_args[@]}"; then
-      cleanup_active
-      return 1
+    if [ "$SELECTED_ENCODER" = software ]; then
+      if ! run_software_hevc_encode "$input" "$ACTIVE_TEMP" "$video_kbps" "${mapping_args[@]}"; then
+        cleanup_active
+        return 1
+      fi
+    elif ! run_hardware_hevc_encode "$SELECTED_ENCODER" "$input" "$ACTIVE_TEMP" "$video_kbps" "${mapping_args[@]}"; then
+      rm -f -- "$ACTIVE_TEMP"
+      if [ "$CRITICAL_DISK_TRIGGERED" = true ]; then
+        warn "Encoding stopped because the destination filesystem has critically low free space."
+        cleanup_active
+        return 1
+      fi
+      if [ "$ENCODER" = auto ] && [ "$CAP_SOFTWARE" = true ]; then
+        warn "Hardware encoder unavailable; retrying with software HEVC."
+        SELECTED_ENCODER=software
+        if ! run_software_hevc_encode "$input" "$ACTIVE_TEMP" "$video_kbps" "${mapping_args[@]}"; then
+          cleanup_active
+          return 1
+        fi
+      else
+        warn "Requested hardware encoder $(encoder_display_name "$SELECTED_ENCODER") failed; software fallback was not requested."
+        cleanup_active
+        return 1
+      fi
     fi
   fi
 
@@ -754,6 +960,20 @@ process_file() {
   fi
 }
 
+if [ "${1-}" = "capabilities" ]; then
+  if [ "$#" -ne 2 ] || [ "$2" != "--json" ]; then
+    die "capabilities requires --json."
+  fi
+  if command -v ffmpeg >/dev/null 2>&1; then
+    detect_hardware_capabilities
+  else
+    CAP_SOFTWARE=false CAP_QSV=false CAP_VAAPI=false CAP_NVENC=false
+    QSV_DEVICE="" VAAPI_DEVICE="" AUTO_ENCODER=""
+  fi
+  print_capabilities_json
+  exit 0
+fi
+
 if [ "${1-}" = "doctor" ]; then
   [ "$#" -eq 1 ] || die "doctor does not accept additional arguments."
   doctor
@@ -777,6 +997,7 @@ elif [ "$1" = "guided" ]; then
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --dry-run) DRY_RUN=true; shift ;;
+      --encoder) require_option_value "$1" "$#" "${2-}"; ENCODER="$2"; shift 2 ;;
       --machine-progress) MACHINE_PROGRESS=true; shift ;;
       *) die "guided mode only supports --dry-run and --machine-progress; unsupported argument: $1" ;;
     esac
@@ -807,6 +1028,11 @@ else
       --codec)
         require_option_value "$1" "$#" "${2-}"
         CODEC="$2"
+        shift 2
+        ;;
+      --encoder)
+        require_option_value "$1" "$#" "${2-}"
+        ENCODER="$2"
         shift 2
         ;;
       --container)
@@ -840,6 +1066,7 @@ fi
 [[ "$TARGET_MB" =~ ^[1-9][0-9]*$ ]] || die "--size must be a positive whole number of megabytes."
 case "$QUALITY" in fast|good|best) ;; *) die "--quality must be fast, good, or best." ;; esac
 case "$CODEC" in auto|hevc|av1) ;; *) die "--codec must be auto, hevc, or av1." ;; esac
+case "$ENCODER" in auto|software|qsv|vaapi|nvenc) ;; *) die "--encoder must be auto, software, qsv, vaapi, or nvenc." ;; esac
 case "$CONTAINER" in mkv|mp4) ;; *) die "--container must be mkv or mp4." ;; esac
 
 declare -a FFMPEG_PROGRESS_ARGS=(-stats)
@@ -867,16 +1094,42 @@ has_encoder "$ENCODER_LIST" libsvtav1 && HAS_SVTAV1=true
 
 case "$CODEC" in
   auto)
-    [ "$HAS_X265" = true ] || die "Auto mode requires HEVC/libx265. Use --codec av1 explicitly if AV1 is available."
     CODEC="hevc"
     ;;
-  hevc)
-    [ "$HAS_X265" = true ] || die "HEVC/libx265 is not available in this ffmpeg build."
-    ;;
+  hevc) ;;
   av1)
     [ "$HAS_SVTAV1" = true ] || die "AV1/libsvtav1 is not available in this ffmpeg build."
     ;;
 esac
+
+SELECTED_ENCODER=software
+if [ "$CODEC" = hevc ]; then
+  detect_hardware_capabilities
+  case "$ENCODER" in
+    auto)
+      [ -n "$AUTO_ENCODER" ] || die "No working HEVC encoder is available."
+      SELECTED_ENCODER="$AUTO_ENCODER"
+      ;;
+    software)
+      [ "$CAP_SOFTWARE" = true ] || die "Software HEVC/libx265 is unavailable."
+      SELECTED_ENCODER=software
+      ;;
+    qsv)
+      [ "$CAP_QSV" = true ] || die "Intel QSV HEVC was requested but could not initialize on any accessible DRM render device."
+      SELECTED_ENCODER=qsv
+      ;;
+    vaapi)
+      [ "$CAP_VAAPI" = true ] || die "VAAPI HEVC was requested but could not initialize on any accessible DRM render device."
+      SELECTED_ENCODER=vaapi
+      ;;
+    nvenc)
+      [ "$CAP_NVENC" = true ] || die "NVIDIA NVENC HEVC was requested but could not initialize with the installed runtime."
+      SELECTED_ENCODER=nvenc
+      ;;
+  esac
+elif [ "$ENCODER" != auto ] && [ "$ENCODER" != software ]; then
+  die "--encoder ${ENCODER} applies to HEVC; software AV1 remains available through --codec av1."
+fi
 
 case "$QUALITY" in
   fast) X265_PRESET="fast"; SVT_PRESET=8 ;;

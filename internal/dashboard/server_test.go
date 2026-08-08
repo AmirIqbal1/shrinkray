@@ -111,14 +111,19 @@ func TestDashboardServesLogScrollHelpersBeforeApplication(t *testing.T) {
 		t.Fatalf("dashboard index status = %d; want %d", index.Code, http.StatusOK)
 	}
 	logScrollIndex := strings.Index(index.Body.String(), `src="/log-scroll.js"`)
+	encoderOptionsIndex := strings.Index(index.Body.String(), `src="/encoder-options.js"`)
 	appIndex := strings.Index(index.Body.String(), `src="/app.js"`)
-	if logScrollIndex < 0 || appIndex < 0 || logScrollIndex > appIndex {
+	if logScrollIndex < 0 || encoderOptionsIndex < 0 || appIndex < 0 || logScrollIndex > encoderOptionsIndex || encoderOptionsIndex > appIndex {
 		t.Fatalf("dashboard scripts are missing or out of order: %s", index.Body.String())
 	}
 
 	helpers := requestServer(t, server, http.MethodGet, "/log-scroll.js", nil)
 	if helpers.Code != http.StatusOK || !strings.Contains(helpers.Body.String(), "captureLogScroll") {
 		t.Fatalf("log scroll helper response = %d, %s", helpers.Code, helpers.Body.String())
+	}
+	encoderOptions := requestServer(t, server, http.MethodGet, "/encoder-options.js", nil)
+	if encoderOptions.Code != http.StatusOK || !strings.Contains(encoderOptions.Body.String(), "buildEncoderOptions") {
+		t.Fatalf("encoder options helper response = %d, %s", encoderOptions.Code, encoderOptions.Body.String())
 	}
 }
 
@@ -167,5 +172,19 @@ func TestClearHistoryEndpointAndDashboardControls(t *testing.T) {
 	application := requestServer(t, server, http.MethodGet, "/app.js", nil)
 	if !strings.Contains(application.Body.String(), "Clear completed, failed and cancelled job history?") {
 		t.Fatal("dashboard clear-history confirmation is missing")
+	}
+}
+
+func TestCapabilitiesEndpointDoesNotExposeDeviceDetails(t *testing.T) {
+	server, _, _ := makeTwoRootServer(t)
+	server.capabilities = EncoderCapabilities{Encoders: EncoderAvailability{Software: true, QSV: true}, AutoSelected: "qsv"}
+	response := requestServer(t, server, http.MethodGet, "/api/capabilities", nil)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"qsv":true`) || !strings.Contains(response.Body.String(), `"auto_selected":"qsv"`) {
+		t.Fatalf("capabilities response = %d, %s", response.Code, response.Body.String())
+	}
+	for _, forbidden := range []string{"renderD", "hostname", "serial"} {
+		if strings.Contains(response.Body.String(), forbidden) {
+			t.Fatalf("capabilities response exposed %q: %s", forbidden, response.Body.String())
+		}
 	}
 }

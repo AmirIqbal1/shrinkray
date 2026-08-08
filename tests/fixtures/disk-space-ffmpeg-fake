@@ -6,6 +6,10 @@ if [[ " $* " == *" -encoders "* ]]; then
   printf ' V..... libsvtav1 fake AV1 encoder\n'
   exit 0
 fi
+if [[ " $* " == *" -hwaccels "* ]]; then
+  printf 'Hardware acceleration methods:\n'
+  exit 0
+fi
 
 marker="${SHRINKRAY_TEST_ENCODE_MARKER:?encode marker is required}"
 printf 'started\n' >> "$marker"
