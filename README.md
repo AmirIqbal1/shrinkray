@@ -351,6 +351,19 @@ Shrinkray never deletes or replaces the source movie. It encodes to a temporary
 file ending in `.part`, validates that file with `ffprobe`, and only then moves
 it to the requested output name. Failed and interrupted encodes are cleaned up.
 
+### Disk space safety
+
+Before each encode, Shrinkray checks free space on the filesystem containing the
+output directory. It requires the target output size, a 512 MB encoder working
+allowance, and a safety reserve equal to the larger of 2 GB or 10% of that
+filesystem's capacity. Queued dashboard jobs are checked again immediately
+before encoding because available space can change while they wait.
+
+While an encode is active, Shrinkray continues checking the destination. If free
+space falls below the critical 512 MB floor, it stops the encoder and removes
+only its `.part` output and temporary encoder files. This protection never
+deletes or modifies the original movie or unrelated files.
+
 MKV output keeps global metadata, chapters, and available subtitles. MP4 output
 drops subtitles because common movie subtitle formats are not always compatible
 with MP4. Audio is optional, so silent videos work too.

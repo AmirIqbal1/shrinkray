@@ -38,7 +38,8 @@ func NewServer(roots *RootRegistry, shrinkrayBin, stateDir, version string) (*Se
 		return nil, errors.New("at least one media root is required")
 	}
 	s := &Server{roots: roots, stateDir: stateDir, version: version}
-	s.jobs = NewJobManager(roots, NewCLIRunner(roots, shrinkrayBin))
+	diskSpace := FilesystemDiskSpaceChecker{}
+	s.jobs = newJobManagerWithDiskSpace(roots, newCLIRunnerWithDiskSpace(roots, shrinkrayBin, diskSpace), diskSpace)
 	s.handler = s.routes()
 	return s, nil
 }

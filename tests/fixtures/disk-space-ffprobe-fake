@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ " $* " == *" -select_streams v:0 "* ]]; then
+  printf 'video\n'
+else
+  printf '10.0\n'
+fi
