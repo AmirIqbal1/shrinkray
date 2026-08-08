@@ -21,13 +21,18 @@ function formatDuration(seconds) {
   const hours = Math.floor(total / 3600);
   const mins = Math.floor((total % 3600) / 60);
   const secs = total % 60;
-  return hours ? `${hours}h ${mins}m` : `${mins}m ${secs}s`;
+  if (hours) return `${hours}h ${mins}m`;
+  if (mins) return `${mins}m ${secs}s`;
+  return `${secs}s`;
 }
 
 function formatElapsed(seconds) {
-  const mins = Math.floor(seconds / 60);
-  const secs = seconds % 60;
-  return mins ? `${mins}m ${secs}s` : `${secs}s`;
+  return formatDuration(seconds);
+}
+
+function formatPercent(value) {
+  const percent = Math.max(0, Math.min(100, Number(value) || 0));
+  return percent === 100 ? '100%' : `${percent.toFixed(1)}%`;
 }
 
 function formatQueued(value) {
@@ -251,6 +256,13 @@ function normalizeJob(job) {
     root_label: typeof job.root_label === 'string' ? job.root_label : 'Unknown library',
     queued_at: job.queued_at,
     elapsed_seconds: numberOrZero(job.elapsed_seconds),
+    progress_percent: numberOrZero(job.progress_percent),
+    stage_progress_percent: numberOrZero(job.stage_progress_percent),
+    duration_seconds: numberOrZero(job.duration_seconds),
+    processed_seconds: numberOrZero(job.processed_seconds),
+    eta_seconds: job.eta_seconds === null || job.eta_seconds === undefined ? null : numberOrZero(job.eta_seconds),
+    encode_speed: numberOrZero(job.encode_speed),
+    eta_is_estimate: job.eta_is_estimate === true,
     result_size: numberOrZero(job.result_size),
     saved_percent: numberOrZero(job.saved_percent),
     logs: Array.isArray(job.logs) ? job.logs : [],
@@ -293,8 +305,21 @@ function renderJobs() {
   container.innerHTML = state.jobs.map((job) => {
     const active = job.state === 'running';
     const cancellable = active || job.state === 'queued';
+    const showProgress = active || job.state === 'completed' || job.progress_percent > 0;
+    const overallPercent = job.state === 'completed' ? 100 : Math.max(0, Math.min(99, job.progress_percent));
+    const showPassProgress = job.stage.startsWith('HEVC pass');
+    const progress = showProgress ? `<div class="job-progress">
+      <div class="progress-labels"><strong>${formatPercent(overallPercent)} overall</strong>${showPassProgress ? `<span>${formatPercent(job.stage_progress_percent)} current pass</span>` : ''}</div>
+      <div class="progress-track" role="progressbar" aria-label="Overall encoding progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${overallPercent.toFixed(1)}"><span style="width: ${overallPercent.toFixed(1)}%"></span></div>
+      <div class="progress-stats">
+        <span><small>Elapsed</small><strong>${formatElapsed(job.elapsed_seconds)}</strong></span>
+        ${job.duration_seconds > 0 ? `<span><small>Media</small><strong>${formatDuration(job.processed_seconds)} / ${formatDuration(job.duration_seconds)}</strong></span>` : ''}
+        ${job.encode_speed > 0 ? `<span><small>Speed</small><strong>${job.encode_speed.toFixed(2)}x</strong></span>` : ''}
+        ${active && job.eta_seconds !== null && job.eta_seconds > 0 ? `<span><small>${job.eta_is_estimate ? 'Estimated ETA' : 'ETA'}</small><strong>${formatDuration(job.eta_seconds)}</strong></span>` : ''}
+      </div>
+    </div>` : '';
     const result = job.state === 'completed'
-      ? `<div class="result"><strong>${formatBytes(job.result_size)}</strong><span>${job.saved_percent >= 0 ? `${job.saved_percent.toFixed(1)}% saved` : 'output is larger'}</span></div>`
+      ? `<div class="result"><strong>100% · Completed</strong><span>${formatBytes(job.result_size)} · ${job.saved_percent >= 0 ? `${job.saved_percent.toFixed(1)}% saved` : 'output is larger'}</span></div>`
       : '';
     const failure = job.failure ? `<p class="failure">${escapeHTML(job.failure)}</p>` : '';
     const logLines = Array.isArray(job.logs) ? job.logs : [];
@@ -313,7 +338,7 @@ function renderJobs() {
         <div class="job-copy"><div class="job-title"><strong>${escapeHTML(job.filename)}</strong><span class="state-pill">${escapeHTML(job.state)}</span></div>
           <p>${escapeHTML(job.root_label)} · ${job.settings.target_mb.toLocaleString()} MB target · ${escapeHTML(jobSettings(job))} · queued ${escapeHTML(formatQueued(job.queued_at))}</p>
           <div class="stage"><span>${escapeHTML(job.stage)}</span><small>${formatElapsed(job.elapsed_seconds)}</small></div>
-          ${failure}${logs}
+          ${progress}${failure}${logs}
         </div>
         ${result}
         ${cancellable ? `<button class="cancel" data-cancel="${job.id}">Cancel</button>` : ''}
@@ -376,7 +401,7 @@ async function initialize() {
   await loadHealth();
   await loadFiles();
   await loadJobs();
-  setInterval(loadJobs, 2000);
+  setInterval(loadJobs, 1000);
 }
 
 initialize();

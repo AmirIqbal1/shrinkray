@@ -116,6 +116,18 @@ select { width: 100%; height: 38px; margin-top: 5px; padding: 0 10px; border: 1p
 .job-copy > p { margin-top: 4px; color: var(--muted); font-size: 10px; }
 .stage { margin-top: 10px; max-width: 430px; display: flex; justify-content: space-between; font-size: 10px; font-weight: 750; }
 .stage small { color: var(--muted); font-weight: 500; }
+.job-progress { max-width: 700px; margin-top: 10px; }
+.progress-labels { display: flex; justify-content: space-between; gap: 12px; color: var(--green); font-size: 10px; }
+.progress-labels span { color: var(--muted); }
+.progress-track { height: 8px; margin-top: 6px; overflow: hidden; border-radius: 999px; background: #e5ebe7; }
+.progress-track span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--green), #42a875); transition: width .35s ease; }
+.job.completed .progress-track span { background: var(--green); }
+.job.failed .progress-track span, .job.cancelled .progress-track span { background: #8c9791; }
+.progress-stats { margin-top: 8px; display: grid; grid-template-columns: repeat(4, minmax(80px, auto)); gap: 8px 18px; }
+.progress-stats span { min-width: 0; }
+.progress-stats small, .progress-stats strong { display: block; }
+.progress-stats small { color: var(--muted); font-size: 8px; font-weight: 700; text-transform: uppercase; letter-spacing: .35px; }
+.progress-stats strong { margin-top: 2px; overflow-wrap: anywhere; font-size: 10px; }
 .failure { color: var(--danger) !important; }
 .result { margin-left: auto; text-align: right; }
 .result strong, .result span { display: block; }
@@ -151,6 +163,8 @@ footer span { margin: 0 8px; color: var(--green); }
   .job-main { flex-wrap: wrap; }
   .job-copy { width: calc(100% - 45px); }
   .result { margin-left: 43px; text-align: left; }
+  .progress-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; }
+  .progress-labels { align-items: flex-start; flex-direction: column; gap: 2px; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; }

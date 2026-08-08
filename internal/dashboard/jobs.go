@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,24 +35,31 @@ type JobSettings struct {
 }
 
 type Job struct {
-	ID             string      `json:"id"`
-	RootID         string      `json:"root_id"`
-	RootLabel      string      `json:"root_label"`
-	Path           string      `json:"path"`
-	Filename       string      `json:"filename"`
-	OutputPath     string      `json:"output_path"`
-	OriginalSize   int64       `json:"original_size"`
-	Settings       JobSettings `json:"settings"`
-	State          JobState    `json:"state"`
-	Stage          string      `json:"stage"`
-	QueuedAt       time.Time   `json:"queued_at"`
-	StartedAt      *time.Time  `json:"started_at,omitempty"`
-	FinishedAt     *time.Time  `json:"finished_at,omitempty"`
-	ElapsedSeconds int64       `json:"elapsed_seconds"`
-	Logs           []string    `json:"logs"`
-	ResultSize     int64       `json:"result_size,omitempty"`
-	SavedPercent   float64     `json:"saved_percent,omitempty"`
-	Failure        string      `json:"failure,omitempty"`
+	ID                   string      `json:"id"`
+	RootID               string      `json:"root_id"`
+	RootLabel            string      `json:"root_label"`
+	Path                 string      `json:"path"`
+	Filename             string      `json:"filename"`
+	OutputPath           string      `json:"output_path"`
+	OriginalSize         int64       `json:"original_size"`
+	Settings             JobSettings `json:"settings"`
+	State                JobState    `json:"state"`
+	Stage                string      `json:"stage"`
+	QueuedAt             time.Time   `json:"queued_at"`
+	StartedAt            *time.Time  `json:"started_at,omitempty"`
+	FinishedAt           *time.Time  `json:"finished_at,omitempty"`
+	ElapsedSeconds       int64       `json:"elapsed_seconds"`
+	ProgressPercent      float64     `json:"progress_percent"`
+	StageProgressPercent float64     `json:"stage_progress_percent"`
+	DurationSeconds      float64     `json:"duration_seconds"`
+	ProcessedSeconds     float64     `json:"processed_seconds"`
+	ETASeconds           *float64    `json:"eta_seconds"`
+	EncodeSpeed          float64     `json:"encode_speed"`
+	ETAIsEstimate        bool        `json:"eta_is_estimate"`
+	Logs                 []string    `json:"logs"`
+	ResultSize           int64       `json:"result_size,omitempty"`
+	SavedPercent         float64     `json:"saved_percent,omitempty"`
+	Failure              string      `json:"failure,omitempty"`
 
 	cancel    context.CancelFunc
 	outputAbs string
@@ -62,7 +70,7 @@ type RunResult struct {
 }
 
 type JobRunner interface {
-	Run(context.Context, *Job, func(string), func(string)) (RunResult, error)
+	Run(context.Context, *Job, func(string), func(ProgressUpdate), func(string)) (RunResult, error)
 }
 
 type CLIRunner struct {
@@ -74,7 +82,7 @@ func NewCLIRunner(roots *RootRegistry, shrinkrayBin string) *CLIRunner {
 	return &CLIRunner{roots: roots, shrinkrayBin: shrinkrayBin}
 }
 
-func (r *CLIRunner) Run(ctx context.Context, job *Job, stage func(string), logLine func(string)) (RunResult, error) {
+func (r *CLIRunner) Run(ctx context.Context, job *Job, stage func(string), progress func(ProgressUpdate), logLine func(string)) (RunResult, error) {
 	stage("Inspecting")
 	mediaRoot, err := r.roots.Get(job.RootID)
 	if err != nil {
@@ -94,7 +102,16 @@ func (r *CLIRunner) Run(ctx context.Context, job *Job, stage func(string), logLi
 		return RunResult{}, errors.New("could not inspect intended output")
 	}
 
-	args := []string{source, "--size", strconv.FormatInt(job.Settings.TargetMB, 10), "--quality", job.Settings.Quality, "--container", job.Settings.Container}
+	duration, err := probeSourceDuration(ctx, source)
+	if err != nil {
+		if ctx.Err() != nil {
+			return RunResult{}, context.Canceled
+		}
+		return RunResult{}, errors.New("ffprobe could not read the source duration")
+	}
+	progress(ProgressUpdate{DurationSeconds: duration})
+
+	args := []string{source, "--size", strconv.FormatInt(job.Settings.TargetMB, 10), "--quality", job.Settings.Quality, "--container", job.Settings.Container, "--machine-progress"}
 	if job.Settings.KeepAllAudio {
 		args = append(args, "--keep-all-audio")
 	}
@@ -128,10 +145,22 @@ func (r *CLIRunner) Run(ctx context.Context, job *Job, stage func(string), logLi
 
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	progressParser := newProgressParser()
+	currentStage := "Inspecting"
 	for scanner.Scan() {
 		line := r.roots.Redact(scanner.Text())
+		if record, complete, machineLine := progressParser.Consume(line); machineLine {
+			if complete {
+				progress(progressFromRecord(currentStage, duration, record))
+			}
+			continue
+		}
+		if isRepetitiveMempolicyWarning(line) {
+			continue
+		}
 		logLine(line)
 		if parsed := stageFromLog(line); parsed != "" {
+			currentStage = parsed
 			stage(parsed)
 		}
 	}
@@ -156,17 +185,31 @@ func (r *CLIRunner) Run(ctx context.Context, job *Job, stage func(string), logLi
 	return RunResult{Size: info.Size()}, nil
 }
 
+func probeSourceDuration(ctx context.Context, source string) (float64, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(probeCtx, "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", source).Output()
+	if err != nil {
+		return 0, err
+	}
+	duration, err := strconv.ParseFloat(strings.TrimSpace(string(output)), 64)
+	if err != nil || duration <= 0 || math.IsNaN(duration) || math.IsInf(duration, 0) {
+		return 0, errors.New("invalid source duration")
+	}
+	return duration, nil
+}
+
 func stageFromLog(line string) string {
 	lower := strings.ToLower(line)
 	switch {
 	case strings.Contains(lower, "pass 1 of 2"):
-		return "HEVC pass 1 of 2"
+		return stageHEVCPass1
 	case strings.Contains(lower, "pass 2 of 2"):
-		return "HEVC pass 2 of 2"
+		return stageHEVCPass2
 	case strings.Contains(lower, "encoding with av1"):
-		return "AV1 encoding"
+		return stageAV1
 	case strings.Contains(lower, "validating output"):
-		return "Validating output"
+		return stageValidation
 	default:
 		return ""
 	}
@@ -350,7 +393,19 @@ func (m *JobManager) worker() {
 		result, err := m.runner.Run(ctx, cloneJob(job, time.Now()), func(stage string) {
 			m.mu.Lock()
 			if job.State == StateRunning {
-				job.Stage = stage
+				updateJobStage(job, stage)
+			}
+			m.mu.Unlock()
+		}, func(update ProgressUpdate) {
+			m.mu.Lock()
+			if job.State == StateRunning {
+				job.ProgressPercent = update.ProgressPercent
+				job.StageProgressPercent = update.StageProgressPercent
+				job.DurationSeconds = update.DurationSeconds
+				job.ProcessedSeconds = update.ProcessedSeconds
+				job.ETASeconds = update.ETASeconds
+				job.EncodeSpeed = update.EncodeSpeed
+				job.ETAIsEstimate = update.ETAIsEstimate
 			}
 			m.mu.Unlock()
 		}, func(line string) {
@@ -373,6 +428,9 @@ func (m *JobManager) worker() {
 			job.State, job.Stage, job.Failure = StateFailed, "Failed", err.Error()
 		} else {
 			job.State, job.Stage, job.ResultSize = StateCompleted, "Completed", result.Size
+			job.ProgressPercent, job.StageProgressPercent = 100, 100
+			job.ProcessedSeconds = job.DurationSeconds
+			job.ETASeconds, job.ETAIsEstimate = nil, false
 			if job.OriginalSize > 0 {
 				job.SavedPercent = (1 - float64(result.Size)/float64(job.OriginalSize)) * 100
 			}
@@ -382,9 +440,38 @@ func (m *JobManager) worker() {
 	}
 }
 
+func updateJobStage(job *Job, stage string) {
+	previous := job.Stage
+	job.Stage = stage
+	if previous == stage {
+		return
+	}
+	switch stage {
+	case stageHEVCPass1, stageAV1:
+		job.ProgressPercent = 0
+		job.StageProgressPercent = 0
+		job.ProcessedSeconds = 0
+		job.EncodeSpeed = 0
+		job.ETASeconds, job.ETAIsEstimate = nil, false
+	case stageHEVCPass2:
+		job.ProgressPercent = 50
+		job.StageProgressPercent = 0
+		job.ProcessedSeconds = 0
+		job.EncodeSpeed = 0
+		job.ETASeconds, job.ETAIsEstimate = nil, false
+	case stageValidation:
+		job.ProgressPercent = 99
+		job.ETASeconds, job.ETAIsEstimate = nil, false
+	}
+}
+
 func cloneJob(job *Job, now time.Time) *Job {
 	copy := *job
 	copy.cancel = nil
+	if job.ETASeconds != nil {
+		eta := *job.ETASeconds
+		copy.ETASeconds = &eta
+	}
 	copy.Logs = append(make([]string, 0, len(job.Logs)), job.Logs...)
 	if job.StartedAt != nil {
 		end := now

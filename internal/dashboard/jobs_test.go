@@ -14,26 +14,33 @@ import (
 )
 
 type controlledRunner struct {
-	mu         sync.Mutex
-	started    chan string
-	release    chan struct{}
-	running    int
-	maxRunning int
-	order      []string
+	mu           sync.Mutex
+	started      chan string
+	release      chan struct{}
+	running      int
+	maxRunning   int
+	order        []string
+	emitProgress bool
 }
 
 func newControlledRunner() *controlledRunner {
 	return &controlledRunner{started: make(chan string, 10), release: make(chan struct{}, 10)}
 }
 
-func (r *controlledRunner) Run(ctx context.Context, job *Job, stage func(string), log func(string)) (RunResult, error) {
+func (r *controlledRunner) Run(ctx context.Context, job *Job, stage func(string), progress func(ProgressUpdate), log func(string)) (RunResult, error) {
 	r.mu.Lock()
 	r.running++
 	if r.running > r.maxRunning {
 		r.maxRunning = r.running
 	}
 	r.order = append(r.order, job.Filename)
+	emitProgress := r.emitProgress
 	r.mu.Unlock()
+	if emitProgress {
+		eta := 120.0
+		stage(stageHEVCPass1)
+		progress(ProgressUpdate{ProgressPercent: 23, StageProgressPercent: 46, DurationSeconds: 100, ProcessedSeconds: 46, ETASeconds: &eta, EncodeSpeed: 0.45, ETAIsEstimate: true})
+	}
 	r.started <- job.ID
 	select {
 	case <-ctx.Done():
@@ -282,12 +289,50 @@ func TestRejectExistingOutput(t *testing.T) {
 
 func TestCancelRunningJob(t *testing.T) {
 	manager, runner, dir := managerFixture(t)
+	runner.emitProgress = true
 	job := submitTestJob(t, manager, dir, "movie.mkv")
 	<-runner.started
 	if err := manager.Cancel(job.ID); err != nil {
 		t.Fatal(err)
 	}
-	waitForState(t, manager, job.ID, StateCancelled)
+	cancelled := waitForState(t, manager, job.ID, StateCancelled)
+	if cancelled.ProgressPercent != 23 || cancelled.StageProgressPercent != 46 || cancelled.ProcessedSeconds != 46 || cancelled.EncodeSpeed != 0.45 {
+		t.Fatalf("cancelled job lost its last progress: %#v", cancelled)
+	}
+	if cancelled.ETASeconds == nil || *cancelled.ETASeconds != 120 || !cancelled.ETAIsEstimate {
+		t.Fatalf("cancelled job lost its ETA state: %#v", cancelled)
+	}
+}
+
+func TestCompletedJobIsAlwaysOneHundredPercent(t *testing.T) {
+	manager, runner, dir := managerFixture(t)
+	job := submitTestJob(t, manager, dir, "complete.mkv")
+	<-runner.started
+	runner.release <- struct{}{}
+	completed := waitForState(t, manager, job.ID, StateCompleted)
+	if completed.ProgressPercent != 100 || completed.StageProgressPercent != 100 || completed.Stage != "Completed" {
+		t.Fatalf("completed job progress = %#v; want 100%% and Completed", completed)
+	}
+}
+
+func TestValidationStageHoldsAtNinetyNinePercent(t *testing.T) {
+	eta := 20.0
+	job := &Job{Stage: stageHEVCPass2, ProgressPercent: 75, StageProgressPercent: 51, ETASeconds: &eta, ETAIsEstimate: false}
+	updateJobStage(job, stageValidation)
+	if job.Stage != stageValidation || job.ProgressPercent != 99 || job.StageProgressPercent != 51 || job.ETASeconds != nil {
+		t.Fatalf("validation transition = %#v", job)
+	}
+}
+
+func TestLegacyJobWithoutProgressInformation(t *testing.T) {
+	legacy := &Job{ID: "old", State: StateCompleted, Stage: "Completed", Logs: []string{}}
+	cloned := cloneJob(legacy, time.Now())
+	if cloned.ProgressPercent != 0 || cloned.DurationSeconds != 0 || cloned.ProcessedSeconds != 0 || cloned.ETASeconds != nil {
+		t.Fatalf("legacy job gained misleading progress information: %#v", cloned)
+	}
+	if _, err := json.Marshal(cloned); err != nil {
+		t.Fatalf("legacy job no longer serializes: %v", err)
+	}
 }
 
 func TestSubmitRejectsDirectory(t *testing.T) {

@@ -28,7 +28,8 @@ Direct mode creates `movie.shrunk.mkv` by default.
 The lightweight server dashboard lets another device browse movies that are
 already on a headless server, inspect them, and queue Shrinkray jobs. It uses a
 single encoding worker so simultaneous software encodes cannot overload a small
-server. The dashboard does not upload, rename, replace, move, or delete files.
+server. Running jobs report live pass progress, encoding speed, and ETA. The
+dashboard does not upload, rename, replace, move, or delete files.
 
 Go 1.22 or newer is required to build and run the server. From a repository
 clone, test it locally with:
@@ -339,6 +340,7 @@ HEVC mode unless you specifically need AV1.
 | `--batch <dir>` | Process videos in a directory | — |
 | `--recursive` | Include subdirectories with `--batch` | off |
 | `--dry-run` | Show planned work without encoding | off |
+| `--machine-progress` | Emit FFmpeg key/value progress for dashboards or automation | off |
 | `-y` | Replace an existing output without asking | off |
 
 Run `shrinkray --help` for usage examples.

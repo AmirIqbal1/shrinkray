@@ -4,6 +4,7 @@ set -euo pipefail
 input="${1:?input is required}"
 shift
 container="mkv"
+machine_progress=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --size|--quality)
@@ -16,6 +17,10 @@ while [ "$#" -gt 0 ]; do
     --keep-all-audio)
       shift
       ;;
+    --machine-progress)
+      machine_progress=true
+      shift
+      ;;
     *)
       printf 'unexpected fake shrinkray argument: %s\n' "$1" >&2
       exit 2
@@ -23,10 +28,21 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+[ "$machine_progress" = true ] || {
+  printf 'dashboard did not request --machine-progress\n' >&2
+  exit 2
+}
+
 output="${input%.*}.shrunk.${container}"
 printf '==> Encoding with HEVC (pass 1 of 2)...\n'
+printf 'out_time_us=250000\nspeed=0.50x\nprogress=continue\n'
 sleep 0.15
+printf 'out_time_ms=1000000\nspeed=0.50x\nprogress=end\n'
 printf '==> Encoding with HEVC (pass 2 of 2)...\n'
+printf 'set_mempolicy: Operation not permitted\n' >&2
+printf 'set_mempolicy: Operation not permitted\n' >&2
+printf 'out_time_us=500000\nspeed=1.00x\nprogress=continue\n'
 sleep 0.15
+printf 'out_time_us=1000000\nspeed=1.00x\nprogress=end\n'
 printf '==> Validating output...\n'
 cp -- "$input" "$output"

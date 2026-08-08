@@ -5,6 +5,8 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 TEMP_DIR="$(mktemp -d)"
 INPUT_FILE="${TEMP_DIR}/synthetic-input.mkv"
 OUTPUT_FILE="${TEMP_DIR}/synthetic-output.mkv"
+MACHINE_OUTPUT_FILE="${TEMP_DIR}/synthetic-machine-output.mkv"
+MACHINE_PROGRESS_LOG="${TEMP_DIR}/machine-progress.log"
 
 cleanup() {
   rm -rf -- "$TEMP_DIR"
@@ -49,3 +51,27 @@ STREAM_TYPE="$(ffprobe -v error -select_streams v:0 \
 }
 
 printf 'Smoke test passed.\n'
+
+printf 'Running shrinkray with machine progress...\n'
+bash "${ROOT_DIR}/shrinkray" "$INPUT_FILE" \
+  --size 1 --quality fast --output "$MACHINE_OUTPUT_FILE" --machine-progress -y \
+  >"$MACHINE_PROGRESS_LOG"
+
+[ -s "$MACHINE_OUTPUT_FILE" ] || {
+  printf 'smoke test: machine-progress encode did not create an output\n' >&2
+  exit 1
+}
+grep -q '^out_time_us=' "$MACHINE_PROGRESS_LOG" || {
+  printf 'smoke test: machine progress did not include out_time_us\n' >&2
+  exit 1
+}
+grep -q '^speed=' "$MACHINE_PROGRESS_LOG" || {
+  printf 'smoke test: machine progress did not include speed\n' >&2
+  exit 1
+}
+grep -q '^progress=end$' "$MACHINE_PROGRESS_LOG" || {
+  printf 'smoke test: machine progress did not terminate records with progress=end\n' >&2
+  exit 1
+}
+
+printf 'Machine-progress smoke test passed.\n'
