@@ -127,12 +127,16 @@ if ! grep -q '"state":"queued"' "${TEMP_DIR}/created-movie.json" || ! grep -q '"
 fi
 
 SAW_SEQUENTIAL=false
+SAW_PROGRESS=false
 SAW_BOTH_COMPLETED=false
 for _ in $(seq 1 100); do
   curl -fsS "${BASE_URL}/api/jobs" >"${TEMP_DIR}/jobs.json"
 	if grep -q '"state":"running"' "${TEMP_DIR}/jobs.json" && grep -q '"state":"queued"' "${TEMP_DIR}/jobs.json"; then
 		SAW_SEQUENTIAL=true
 	fi
+  if grep -q '"state":"running"' "${TEMP_DIR}/jobs.json" && grep -Eq '"eta_seconds":[0-9]' "${TEMP_DIR}/jobs.json" && grep -Eq '"duration_seconds":[1-9]' "${TEMP_DIR}/jobs.json"; then
+    SAW_PROGRESS=true
+  fi
   if grep -q '"state":"completed".*"state":"completed"' "${TEMP_DIR}/jobs.json"; then
     SAW_BOTH_COMPLETED=true
     break
@@ -145,11 +149,25 @@ done
   sed -n '1,200p' "${TEMP_DIR}/jobs.json" >&2
   exit 1
 }
+[ "$SAW_PROGRESS" = true ] || {
+  printf 'server smoke test: machine progress did not reach the jobs API\n' >&2
+  sed -n '1,200p' "${TEMP_DIR}/jobs.json" >&2
+  exit 1
+}
 [ "$SAW_BOTH_COMPLETED" = true ] || {
   printf 'server smoke test: both jobs did not complete\n' >&2
   sed -n '1,200p' "${TEMP_DIR}/jobs.json" >&2
   exit 1
 }
+if [ "$(grep -o '"progress_percent":100' "${TEMP_DIR}/jobs.json" | wc -l)" -lt 2 ]; then
+  printf 'server smoke test: completed jobs did not report 100%%\n' >&2
+  sed -n '1,200p' "${TEMP_DIR}/jobs.json" >&2
+  exit 1
+fi
+if grep -q 'set_mempolicy: Operation not permitted' "${TEMP_DIR}/jobs.json"; then
+  printf 'server smoke test: repetitive set_mempolicy warning reached dashboard logs\n' >&2
+  exit 1
+fi
 [ -s "${MOVIES_ROOT}/dashboard-movie.shrunk.mkv" ] || {
   printf 'server smoke test: fake Movies output is missing\n' >&2
   exit 1

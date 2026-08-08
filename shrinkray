@@ -15,6 +15,7 @@ KEEP_ALL_AUDIO=false
 OUTPUT=""
 DRY_RUN=false
 FORCE=false
+MACHINE_PROGRESS=false
 BATCH_DIR=""
 RECURSIVE=false
 
@@ -49,6 +50,7 @@ OPTIONS:
   --batch <dir>       Process video files in a directory
   --recursive         Include subdirectories in batch mode
   --dry-run           Show what would happen without encoding
+  --machine-progress  Emit machine-readable FFmpeg progress (dashboard use)
   -y                  Replace an existing output without asking
   -h, --help          Show this help
   --version           Show version
@@ -446,7 +448,7 @@ run_hevc_encode() {
   local -a mapping_args=("$@")
 
   say "Encoding with HEVC (pass 1 of 2)..."
-  if ! ffmpeg -y -hide_banner -loglevel warning -stats \
+  if ! ffmpeg -y -hide_banner -loglevel warning "${FFMPEG_PROGRESS_ARGS[@]}" \
       -i "$input" -map 0:v:0 \
       -c:v libx265 -preset "$X265_PRESET" -b:v "${video_kbps}k" \
       -x265-params "pass=1:stats=${ACTIVE_WORKDIR}/x265_2pass.log:log-level=error" \
@@ -456,7 +458,7 @@ run_hevc_encode() {
   fi
 
   say "Encoding with HEVC (pass 2 of 2)..."
-  if ! ffmpeg -y -hide_banner -loglevel warning -stats \
+  if ! ffmpeg -y -hide_banner -loglevel warning "${FFMPEG_PROGRESS_ARGS[@]}" \
       -i "$input" "${mapping_args[@]}" \
       -map_metadata 0 -map_chapters 0 \
       -c:v libx265 -preset "$X265_PRESET" -b:v "${video_kbps}k" \
@@ -477,7 +479,7 @@ run_av1_encode() {
   local -a mapping_args=("$@")
 
   say "Encoding with AV1... software AV1 encoding can be very slow."
-  ffmpeg -y -hide_banner -loglevel warning -stats \
+  ffmpeg -y -hide_banner -loglevel warning "${FFMPEG_PROGRESS_ARGS[@]}" \
     -i "$input" "${mapping_args[@]}" \
     -map_metadata 0 -map_chapters 0 \
     -c:v libsvtav1 -preset "$SVT_PRESET" -b:v "${video_kbps}k" \
@@ -642,7 +644,8 @@ elif [ "$1" = "guided" ]; then
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --dry-run) DRY_RUN=true; shift ;;
-      *) die "guided mode only supports --dry-run; unsupported argument: $1" ;;
+      --machine-progress) MACHINE_PROGRESS=true; shift ;;
+      *) die "guided mode only supports --dry-run and --machine-progress; unsupported argument: $1" ;;
     esac
   done
 fi
@@ -691,6 +694,7 @@ else
       --keep-all-audio) KEEP_ALL_AUDIO=true; shift ;;
       --recursive) RECURSIVE=true; shift ;;
       --dry-run) DRY_RUN=true; shift ;;
+      --machine-progress) MACHINE_PROGRESS=true; shift ;;
       -y) FORCE=true; shift ;;
       -h|--help) usage; exit 0 ;;
       --version) printf 'shrinkray v%s\n' "$VERSION"; exit 0 ;;
@@ -704,6 +708,11 @@ fi
 case "$QUALITY" in fast|good|best) ;; *) die "--quality must be fast, good, or best." ;; esac
 case "$CODEC" in auto|hevc|av1) ;; *) die "--codec must be auto, hevc, or av1." ;; esac
 case "$CONTAINER" in mkv|mp4) ;; *) die "--container must be mkv or mp4." ;; esac
+
+declare -a FFMPEG_PROGRESS_ARGS=(-stats)
+if [ "$MACHINE_PROGRESS" = true ]; then
+  FFMPEG_PROGRESS_ARGS=(-progress pipe:1 -nostats)
+fi
 
 if [ -n "$BATCH_DIR" ]; then
   [ "${#INPUTS[@]}" -eq 0 ] || die "Do not provide input files with --batch."
