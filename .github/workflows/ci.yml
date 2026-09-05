@@ -22,6 +22,11 @@ jobs:
         with:
           go-version: '1.22.x'
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+
       - name: Run ShellCheck
         run: shellcheck install.sh shrinkray tests/*.sh
 
@@ -33,6 +38,9 @@ jobs:
 
       - name: Run Go tests
         run: go test ./...
+
+      - name: Run dashboard JavaScript tests
+        run: node --test tests/*-test.js
 
       - name: Build server
         run: go build ./cmd/shrinkray-server

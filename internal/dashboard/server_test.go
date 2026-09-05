@@ -112,8 +112,9 @@ func TestDashboardServesLogScrollHelpersBeforeApplication(t *testing.T) {
 	}
 	logScrollIndex := strings.Index(index.Body.String(), `src="/log-scroll.js"`)
 	encoderOptionsIndex := strings.Index(index.Body.String(), `src="/encoder-options.js"`)
+	batchUIIndex := strings.Index(index.Body.String(), `src="/batch-ui.js"`)
 	appIndex := strings.Index(index.Body.String(), `src="/app.js"`)
-	if logScrollIndex < 0 || encoderOptionsIndex < 0 || appIndex < 0 || logScrollIndex > encoderOptionsIndex || encoderOptionsIndex > appIndex {
+	if logScrollIndex < 0 || encoderOptionsIndex < 0 || batchUIIndex < 0 || appIndex < 0 || logScrollIndex > encoderOptionsIndex || encoderOptionsIndex > batchUIIndex || batchUIIndex > appIndex {
 		t.Fatalf("dashboard scripts are missing or out of order: %s", index.Body.String())
 	}
 
@@ -124,6 +125,10 @@ func TestDashboardServesLogScrollHelpersBeforeApplication(t *testing.T) {
 	encoderOptions := requestServer(t, server, http.MethodGet, "/encoder-options.js", nil)
 	if encoderOptions.Code != http.StatusOK || !strings.Contains(encoderOptions.Body.String(), "buildEncoderOptions") {
 		t.Fatalf("encoder options helper response = %d, %s", encoderOptions.Code, encoderOptions.Body.String())
+	}
+	batchUI := requestServer(t, server, http.MethodGet, "/batch-ui.js", nil)
+	if batchUI.Code != http.StatusOK || !strings.Contains(batchUI.Body.String(), "aggregateBatch") {
+		t.Fatalf("batch UI helper response = %d, %s", batchUI.Code, batchUI.Body.String())
 	}
 }
 
@@ -210,6 +215,116 @@ func TestCapabilitiesEndpointDoesNotExposeDeviceDetails(t *testing.T) {
 	for _, forbidden := range []string{"renderD", "hostname", "serial"} {
 		if strings.Contains(response.Body.String(), forbidden) {
 			t.Fatalf("capabilities response exposed %q: %s", forbidden, response.Body.String())
+		}
+	}
+}
+
+func TestBatchJobsEndpointCreatesAllJobsInOrder(t *testing.T) {
+	server, movies, _ := makeTwoRootServer(t)
+	paths := []string{"first.mkv", "second.mkv", "third.mp4"}
+	for _, name := range paths {
+		writeTestFile(t, filepath.Join(movies, name))
+	}
+	body, err := json.Marshal(createBatchRequest{
+		RootID: "movies", Paths: paths, Preset: "exact", Container: "mkv", ExactMB: 9, RequestedEncoder: "auto",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := requestServer(t, server, http.MethodPost, "/api/jobs/batch", body)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("batch response = %d, %s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		BatchID string `json:"batch_id"`
+		Jobs    []*Job `json:"jobs"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !validBatchID(payload.BatchID) || len(payload.Jobs) != 3 {
+		t.Fatalf("batch payload = %#v", payload)
+	}
+	for index, job := range payload.Jobs {
+		if job.Path != paths[index] || job.BatchID != payload.BatchID || job.BatchIndex != index+1 || job.BatchSize != 3 || job.Settings.TargetMB != 9 {
+			t.Fatalf("batch response job %d = %#v", index, job)
+		}
+	}
+}
+
+func TestBatchJobsEndpointRejectsWholeInvalidBatch(t *testing.T) {
+	server, movies, _ := makeTwoRootServer(t)
+	writeTestFile(t, filepath.Join(movies, "valid.mkv"))
+	tests := []struct {
+		name  string
+		paths []string
+	}{
+		{name: "empty", paths: []string{}},
+		{name: "invalid member", paths: []string{"valid.mkv", "missing.mkv"}},
+		{name: "duplicate", paths: []string{"valid.mkv", "valid.mkv"}},
+		{name: "too many", paths: make([]string, MaxBatchSize+1)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body, err := json.Marshal(createBatchRequest{RootID: "movies", Paths: test.paths, Preset: "balanced", Container: "mkv"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := requestServer(t, server, http.MethodPost, "/api/jobs/batch", body)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("invalid batch response = %d, %s", response.Code, response.Body.String())
+			}
+			if jobs := server.jobs.List(); len(jobs) != 0 {
+				t.Fatalf("invalid batch created jobs: %#v", jobs)
+			}
+		})
+	}
+}
+
+func TestBatchCancellationEndpointCancelsQueuedAndRunning(t *testing.T) {
+	dir := t.TempDir()
+	roots, err := NewRootRegistry([]string{"Movies=" + dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := newControlledRunner()
+	manager := NewJobManager(roots, runner)
+	server := &Server{roots: roots, jobs: manager, version: "test"}
+	server.handler = server.routes()
+	t.Cleanup(server.Close)
+	for _, name := range []string{"first.mkv", "second.mkv"} {
+		writeTestFile(t, filepath.Join(dir, name))
+	}
+	jobs, err := manager.SubmitBatch("movies", []string{"first.mkv", "second.mkv"}, "balanced", "mkv", false, 0, false, "auto")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStartedID(t, runner, jobs[0].ID)
+	body := []byte(`{"cancel_running":true}`)
+	response := requestServer(t, server, http.MethodPost, "/api/batches/"+jobs[0].BatchID+"/cancel", body)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"queued_cancelled":1`) || !strings.Contains(response.Body.String(), `"running_cancelled":true`) {
+		t.Fatalf("batch cancellation response = %d, %s", response.Code, response.Body.String())
+	}
+	waitForState(t, manager, jobs[0].ID, StateCancelled)
+	invalid := requestServer(t, server, http.MethodPost, "/api/batches/batch-not-hex/cancel", body)
+	if invalid.Code != http.StatusNotFound {
+		t.Fatalf("unsafe batch ID status = %d; want 404", invalid.Code)
+	}
+}
+
+func TestDashboardIncludesAccessibleBatchSelectionControls(t *testing.T) {
+	server, _, _ := makeTwoRootServer(t)
+	index := requestServer(t, server, http.MethodGet, "/", nil)
+	html := index.Body.String()
+	for _, expected := range []string{"Select all movies", "Clear selection", "0 movies selected", "Exact size applies to each selected movie.", `src="/batch-ui.js"`} {
+		if !strings.Contains(html, expected) {
+			t.Fatalf("dashboard is missing %q", expected)
+		}
+	}
+	application := requestServer(t, server, http.MethodGet, "/app.js", nil)
+	for _, expected := range []string{"Queue ${count} movies", "Cancel the running movie and all remaining queued movies in this batch?", "data-select-path", "entry.type === 'directory'"} {
+		if !strings.Contains(application.Body.String(), expected) {
+			t.Fatalf("dashboard application is missing %q", expected)
 		}
 	}
 }

@@ -69,6 +69,25 @@ Separate roots are safer than `--root /media`: Shrinkray can browse only the
 configured Movies and TV libraries, not unrelated folders that happen to live
 under `/media`. Configured roots must not overlap.
 
+### Batch queue
+
+In the dashboard, select movie checkboxes as you browse, or use **Select all
+movies** for the files visible in the current folder. Apply one set of shrink
+settings and queue up to 100 selected movies together. Exact size is applied to
+each movie; percentage presets are calculated independently from each source
+file by the server.
+
+Shrinkray keeps one global worker and processes batch movies one at a time.
+Each movie retains its own progress, ETA, logs, result, and history, while the
+dashboard also shows aggregate batch progress. Batch identity and queued order
+survive server or container restarts. Safe replacement runs as an independent
+validated filesystem transaction for each movie.
+
+**Cancel remaining batch** cancels queued members and, after explicit browser
+confirmation, can request cancellation of the running member. Completed jobs
+and successful outputs remain in history, and cancellation never deletes source
+media.
+
 ### Systemd server installation
 
 On Ubuntu Server, Ubuntu Desktop, or Linux Mint, install the CLI, dashboard,

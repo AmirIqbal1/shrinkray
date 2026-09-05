@@ -1,6 +1,8 @@
 const state = {
   currentPath: '',
   selected: null,
+  selections: new Map(),
+  visibleEntries: [],
   roots: [],
   rootID: '',
   jobs: [],
@@ -11,6 +13,8 @@ const state = {
 };
 const $ = (selector) => document.querySelector(selector);
 const { captureLogScroll, restoreLogScroll } = window.ShrinkrayLogScroll;
+const { selectionKey, visibleMoviePaths, aggregateBatch } = window.ShrinkrayBatchUI;
+const MAX_BATCH_SIZE = 100;
 
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes < 1) return '0 B';
@@ -47,6 +51,10 @@ function escapeHTML(value) {
   const node = document.createElement('span');
   node.textContent = String(value ?? '');
   return node.innerHTML;
+}
+
+function escapeAttribute(value) {
+  return escapeHTML(value).replaceAll('"', '&quot;').replaceAll("'", '&#39;');
 }
 
 async function api(url, options = {}) {
@@ -111,7 +119,7 @@ function currentRoot() {
 function renderLibrarySelector() {
   const selector = $('#library-selector');
   selector.innerHTML = state.roots.map((root) => `
-    <button type="button" data-root-id="${escapeHTML(root.id)}" class="${root.id === state.rootID ? 'active' : ''}" aria-pressed="${root.id === state.rootID}">${escapeHTML(root.label)}</button>
+    <button type="button" data-root-id="${escapeAttribute(root.id)}" class="${root.id === state.rootID ? 'active' : ''}" aria-pressed="${root.id === state.rootID}">${escapeHTML(root.label)}</button>
   `).join('');
   const selected = currentRoot();
   const summary = selected ? `${selected.label}${state.roots.length > 1 ? ` · ${state.roots.length} libraries` : ''}` : 'No media libraries';
@@ -119,14 +127,41 @@ function renderLibrarySelector() {
   $('#movie-root').title = summary;
 }
 
+function selectedMovies() {
+  return Array.from(state.selections.values()).filter((movie) => movie.root_id === state.rootID);
+}
+
+function renderSelectionControls() {
+  const movies = selectedMovies();
+  const count = movies.length;
+  $('#selection-count').textContent = `${count} ${count === 1 ? 'movie' : 'movies'} selected`;
+  $('#clear-selection').disabled = count === 0;
+  $('#select-visible').disabled = visibleMoviePaths(state.visibleEntries).length === 0;
+  $('#settings-fieldset').disabled = count === 0;
+  $('#queue-submit-label').textContent = count > 1 ? `Queue ${count} movies` : 'Add to queue';
+  document.querySelectorAll('[data-select-path]').forEach((checkbox) => {
+    const checked = state.selections.has(selectionKey(state.rootID, checkbox.dataset.selectPath));
+    checkbox.checked = checked;
+    checkbox.closest('.file-row')?.classList.toggle('batch-selected', checked);
+  });
+  updateTarget();
+}
+
+function clearSelections() {
+  state.selections.clear();
+  renderSelectionControls();
+}
+
 function clearMovieSelection() {
   state.selected = null;
+  state.selections.clear();
+  state.visibleEntries = [];
   $('#details-hint').textContent = 'Select a movie to inspect it.';
   $('#movie-details').innerHTML = '<div class="details-placeholder">No movie selected</div>';
   $('#job-form').reset();
-  $('#settings-fieldset').disabled = true;
   $('#target-size').textContent = '—';
   $('#exact-size').disabled = true;
+  renderSelectionControls();
 }
 
 async function switchLibrary(rootID) {
@@ -153,21 +188,34 @@ async function loadFiles(folder = '') {
     const entries = Array.isArray(listing.entries)
       ? listing.entries.filter((entry) => entry && typeof entry === 'object')
       : [];
+    state.visibleEntries = entries;
     state.currentPath = typeof listing.path === 'string' ? listing.path : '';
     renderBreadcrumbs();
     const list = $('#file-list');
     if (!entries.length) {
       list.innerHTML = '<div class="empty">No supported movies or folders here.</div>';
+      renderSelectionControls();
       return;
     }
-    list.innerHTML = entries.map((entry) => `
-      <button class="file-row ${entry.type}" data-path="${escapeHTML(entry.path)}" data-type="${entry.type}">
-        <span class="file-icon" aria-hidden="true">${entry.type === 'directory' ? '⌑' : '▶'}</span>
-        <span class="file-name">${escapeHTML(entry.name)}</span>
-        ${entry.type === 'file' ? `<span class="file-size">${formatBytes(entry.size)}</span>` : '<span class="file-open">Open</span>'}
-        <span class="chevron" aria-hidden="true">›</span>
-      </button>`).join('');
+    list.innerHTML = entries.map((entry) => {
+      if (entry.type === 'directory') {
+        return `<button type="button" class="file-row directory" data-path="${escapeAttribute(entry.path)}" data-type="directory">
+          <span class="file-icon" aria-hidden="true">⌑</span><span class="file-name">${escapeHTML(entry.name)}</span>
+          <span class="file-open">Open</span><span class="chevron" aria-hidden="true">›</span></button>`;
+      }
+      const checked = state.selections.has(selectionKey(state.rootID, entry.path));
+      const inspected = state.selected?.root_id === state.rootID && state.selected?.path === entry.path;
+      return `<div class="file-row file ${checked ? 'batch-selected' : ''} ${inspected ? 'inspected' : ''}">
+        <label class="movie-select"><input type="checkbox" data-select-path="${escapeAttribute(entry.path)}" aria-label="Select ${escapeAttribute(entry.name)}" ${checked ? 'checked' : ''}><span aria-hidden="true"></span></label>
+        <button type="button" class="file-inspect" data-path="${escapeAttribute(entry.path)}" aria-label="Inspect ${escapeAttribute(entry.name)}">
+          <span class="file-icon" aria-hidden="true">▶</span><span class="file-name">${escapeHTML(entry.name)}</span>
+          <span class="file-size">${formatBytes(entry.size)}</span><span class="chevron" aria-hidden="true">›</span></button>
+      </div>`;
+    }).join('');
+    renderSelectionControls();
   } catch (error) {
+    state.visibleEntries = [];
+    renderSelectionControls();
     showNotice(error.message);
   }
 }
@@ -179,7 +227,7 @@ function renderBreadcrumbs() {
   const crumbs = [`<button data-path="">${escapeHTML(rootLabel)}</button>`];
   parts.forEach((part) => {
     accumulated = accumulated ? `${accumulated}/${part}` : part;
-    crumbs.push(`<span>›</span><button data-path="${escapeHTML(accumulated)}">${escapeHTML(part)}</button>`);
+    crumbs.push(`<span>›</span><button data-path="${escapeAttribute(accumulated)}">${escapeHTML(part)}</button>`);
   });
   $('#breadcrumbs').innerHTML = crumbs.join('');
 }
@@ -187,6 +235,20 @@ function renderBreadcrumbs() {
 async function selectMovie(path) {
   const requestedRootID = state.rootID;
   if (!requestedRootID) return;
+  const entry = state.visibleEntries.find((candidate) => candidate.type === 'file' && candidate.path === path);
+  const key = selectionKey(requestedRootID, path);
+  const canSelect = state.selections.has(key) || selectedMovies().length < MAX_BATCH_SIZE;
+  if (entry && canSelect) {
+    state.selections.set(key, {
+      root_id: requestedRootID,
+      path,
+      filename: entry.name,
+      size: Number(entry.size) || 0,
+    });
+    renderSelectionControls();
+  } else if (entry) {
+    showNotice(`A batch can contain up to ${MAX_BATCH_SIZE} movies.`);
+  }
   $('#movie-details').innerHTML = '<div class="details-placeholder">Inspecting movie…</div>';
   try {
     const movie = await api(`/api/probe?root=${encodeURIComponent(requestedRootID)}&path=${encodeURIComponent(path)}`);
@@ -204,14 +266,45 @@ async function selectMovie(path) {
         <div><dt>Audio tracks</dt><dd>${movie.audio_tracks}</dd></div>
         <div><dt>Subtitle tracks</dt><dd>${movie.subtitle_tracks}</dd></div>
       </dl>`;
-    $('#settings-fieldset').disabled = false;
+    if (canSelect) state.selections.set(selectionKey(requestedRootID, movie.path), movie);
+    renderSelectionControls();
     updateTarget();
-    document.querySelectorAll('.file-row').forEach((row) => row.classList.toggle('selected', row.dataset.path === path));
+    document.querySelectorAll('.file-row.file').forEach((row) => row.classList.toggle('inspected', row.querySelector('.file-inspect')?.dataset.path === path));
   } catch (error) {
     state.selected = null;
-    $('#settings-fieldset').disabled = true;
+    if (canSelect) state.selections.delete(selectionKey(requestedRootID, path));
+    renderSelectionControls();
     showNotice(error.message);
   }
+}
+
+function setMovieSelected(path, checked) {
+  const entry = state.visibleEntries.find((candidate) => candidate.type === 'file' && candidate.path === path);
+  if (!entry) return;
+  const key = selectionKey(state.rootID, path);
+  if (checked) {
+    if (!state.selections.has(key) && selectedMovies().length >= MAX_BATCH_SIZE) {
+      showNotice(`A batch can contain up to ${MAX_BATCH_SIZE} movies.`);
+      renderSelectionControls();
+      return;
+    }
+    state.selections.set(key, { root_id: state.rootID, path, filename: entry.name, size: Number(entry.size) || 0 });
+  } else {
+    state.selections.delete(key);
+  }
+  renderSelectionControls();
+}
+
+function selectAllVisible() {
+  const paths = visibleMoviePaths(state.visibleEntries);
+  const unselected = paths.filter((path) => !state.selections.has(selectionKey(state.rootID, path)));
+  const available = Math.max(0, MAX_BATCH_SIZE - selectedMovies().length);
+  unselected.slice(0, available).forEach((path) => {
+    const entry = state.visibleEntries.find((candidate) => candidate.type === 'file' && candidate.path === path);
+    state.selections.set(selectionKey(state.rootID, path), { root_id: state.rootID, path, filename: entry.name, size: Number(entry.size) || 0 });
+  });
+  if (unselected.length > available) showNotice(`A batch can contain up to ${MAX_BATCH_SIZE} movies.`);
+  renderSelectionControls();
 }
 
 function selectedPreset() {
@@ -219,18 +312,39 @@ function selectedPreset() {
 }
 
 function updateTarget() {
-  if (!state.selected) return;
+  const movies = selectedMovies();
   const preset = selectedPreset();
+  const multiple = movies.length > 1;
   const percentages = { balanced: 0.6, smaller: 0.4, better: 0.75 };
   const exact = Number.parseInt($('#exact-size').value, 10);
-  const mb = preset === 'exact' ? exact : Math.max(1, Math.ceil((state.selected.size * percentages[preset]) / 1048576));
-  $('#target-size').textContent = Number.isInteger(mb) && mb > 0 ? `${mb.toLocaleString()} MB` : 'Enter a size';
   $('#exact-size').disabled = preset !== 'exact';
+  $('#exact-batch-helper').hidden = !(multiple && preset === 'exact');
+  $('#target-label').textContent = multiple ? 'Target for each movie' : 'Calculated target';
+  if (!movies.length) {
+    $('#target-size').textContent = '—';
+    return;
+  }
+  if (preset === 'exact') {
+    $('#target-size').textContent = Number.isInteger(exact) && exact > 0 ? `${exact.toLocaleString()} MB${multiple ? ' each' : ''}` : 'Enter a size';
+    return;
+  }
+  if (multiple) {
+    $('#target-size').textContent = 'Calculated individually';
+    return;
+  }
+  const mb = Math.max(1, Math.ceil((movies[0].size * percentages[preset]) / 1048576));
+  $('#target-size').textContent = `${mb.toLocaleString()} MB`;
 }
 
 async function submitJob(event) {
   event.preventDefault();
-  if (!state.selected) return;
+  const movies = selectedMovies();
+  if (!movies.length) return;
+  if (movies.some((movie) => movie.root_id !== state.rootID)) {
+    clearSelections();
+    showNotice('Movie selection no longer matches the active media library. Select the movies again.');
+    return;
+  }
   const preset = selectedPreset();
   const exact = Number.parseInt($('#exact-size').value, 10);
   if (preset === 'exact' && (!Number.isInteger(exact) || exact < 1)) {
@@ -238,8 +352,7 @@ async function submitJob(event) {
     return;
   }
   const body = {
-    root_id: state.selected.root_id,
-    path: state.selected.path,
+    root_id: state.rootID,
     preset,
     container: $('#container').value,
     keep_all_audio: $('#audio').value === 'all',
@@ -248,8 +361,16 @@ async function submitJob(event) {
     exact_mb: preset === 'exact' ? exact : 0,
   };
   try {
-    await api('/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    showNotice('Movie added to the queue.', 'success');
+    if (movies.length === 1) {
+      body.path = movies[0].path;
+      await api('/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    } else {
+      body.paths = movies.map((movie) => movie.path);
+      await api('/api/jobs/batch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    }
+    showNotice(movies.length === 1 ? 'Movie added to the queue.' : `${movies.length} movies added to the queue as one batch.`, 'success');
+    clearMovieSelection();
+    await loadFiles(state.currentPath);
     await loadJobs();
     document.querySelector('.queue-section').scrollIntoView({ behavior: 'smooth' });
   } catch (error) {
@@ -280,7 +401,7 @@ function normalizeJob(job) {
     ...job,
     id,
     filename: typeof job.filename === 'string' ? job.filename : 'Unknown job',
-    state: typeof job.state === 'string' ? job.state : 'unknown',
+    state: ['queued', 'running', 'completed', 'failed', 'cancelled'].includes(job.state) ? job.state : 'unknown',
     stage: typeof job.stage === 'string' ? job.stage : 'Unknown stage',
     failure: typeof job.failure === 'string' ? job.failure : '',
     root_id: typeof job.root_id === 'string' ? job.root_id : '',
@@ -305,6 +426,9 @@ function normalizeJob(job) {
     source_replaced: job.source_replaced === true,
     original_kept: job.original_kept === true,
     final_path: typeof job.final_path === 'string' ? job.final_path : '',
+    batch_id: typeof job.batch_id === 'string' ? job.batch_id : '',
+    batch_index: numberOrZero(job.batch_index),
+    batch_size: numberOrZero(job.batch_size),
     logs: Array.isArray(job.logs) ? job.logs : [],
     settings: {
       preset: typeof settings.preset === 'string' ? settings.preset : 'balanced',
@@ -382,12 +506,15 @@ function renderJob(job) {
     if (logsOpen) state.expandedLogJobs.add(job.id);
   }
   const logs = logLines.length
-    ? `<details data-job-logs="${escapeHTML(job.id)}" ${logsOpen ? 'open' : ''}><summary>Latest log messages</summary><pre>${logLines.map(escapeHTML).join('\n')}</pre></details>`
+    ? `<details data-job-logs="${escapeAttribute(job.id)}" ${logsOpen ? 'open' : ''}><summary>Latest log messages</summary><pre>${logLines.map(escapeHTML).join('\n')}</pre></details>`
     : '';
-  return `<article class="job ${job.state}" data-job-id="${escapeHTML(job.id)}">
+  const batchContext = job.batch_id && job.batch_size > 0
+    ? `<span class="batch-context">Batch · ${job.batch_index} of ${job.batch_size}</span>`
+    : '';
+  return `<article class="job ${job.state}" data-job-id="${escapeAttribute(job.id)}">
       <div class="job-main">
         <div class="job-state-icon">${active ? '<i class="spinner"></i>' : job.state === 'completed' ? '✓' : job.state === 'failed' ? '!' : job.state === 'cancelled' ? '×' : '…'}</div>
-        <div class="job-copy"><div class="job-title"><strong>${escapeHTML(job.filename)}</strong><span class="state-pill">${escapeHTML(job.state)}</span></div>
+        <div class="job-copy"><div class="job-title"><strong>${escapeHTML(job.filename)}</strong><span class="state-pill">${escapeHTML(job.state)}</span>${batchContext}</div>
           <p>${escapeHTML(job.root_label)} · ${job.settings.target_mb.toLocaleString()} MB target · ${escapeHTML(jobSettings(job))} · queued ${escapeHTML(formatQueued(job.queued_at))}</p>
           <div class="stage"><span>${escapeHTML(job.stage)}</span><small>${formatElapsed(job.elapsed_seconds)}</small></div>
           ${progress}${disk}${actualEncoder}${failure}${logs}
@@ -396,6 +523,40 @@ function renderJob(job) {
         ${cancellable ? `<button class="cancel" data-cancel="${job.id}">Cancel</button>` : ''}
       </div>
     </article>`;
+}
+
+function batchMembers(batchID) {
+  return state.jobs
+    .filter((job) => job.batch_id === batchID)
+    .sort((first, second) => first.batch_index - second.batch_index);
+}
+
+function renderBatchSummary(batchID, allowCancellation) {
+  const members = batchMembers(batchID);
+  const summary = aggregateBatch(members);
+  const shortID = batchID.replace(/^batch-/, '').slice(0, 8);
+  const statuses = [
+    summary.running ? `${summary.running} running` : '',
+    summary.queued ? `${summary.queued} queued` : '',
+    summary.completed ? `${summary.completed} completed` : '',
+    summary.failed ? `${summary.failed} failed` : '',
+    summary.cancelled ? `${summary.cancelled} cancelled` : '',
+  ].filter(Boolean).join(' · ');
+  const cancellable = allowCancellation && (summary.queued > 0 || summary.running > 0);
+  return `<section class="batch-summary" data-batch-summary="${escapeAttribute(batchID)}">
+    <div class="batch-summary-heading"><div><span class="eyebrow">BATCH ${escapeHTML(shortID)}</span><strong>${summary.size} ${summary.size === 1 ? 'movie' : 'movies'}</strong><small>${escapeHTML(statuses)}</small></div>
+      ${cancellable ? `<button type="button" class="cancel batch-cancel" data-cancel-batch="${escapeAttribute(batchID)}">Cancel remaining batch</button>` : ''}
+    </div>
+    <div class="batch-progress"><div class="progress-labels"><strong>Batch progress ${formatPercent(summary.progress)}</strong></div>
+      <div class="progress-track" role="progressbar" aria-label="Batch progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${summary.progress.toFixed(1)}"><span style="width:${summary.progress.toFixed(1)}%"></span></div>
+    </div>
+  </section>`;
+}
+
+function createBatchSummary(batchID, allowCancellation) {
+  const template = document.createElement('template');
+  template.innerHTML = renderBatchSummary(batchID, allowCancellation).trim();
+  return template.content.firstElementChild;
 }
 
 function createJobCard(job) {
@@ -434,20 +595,33 @@ function renderJobs() {
   pruneLogPanelState();
   const previousCards = new Map(Array.from(container.querySelectorAll('.job[data-job-id]'), (card) => [card.dataset.jobId, card]));
   const restorations = [];
-  const createCards = (jobs) => jobs.map((job) => {
-    const card = createJobCard(job);
-    reconcileLogPanel(previousCards.get(job.id), card, restorations);
-    return card;
-  });
-  const activeJobs = state.jobs.filter((job) => job.state === 'queued' || job.state === 'running');
+  const createCards = (jobs, allowBatchCancellation) => {
+    const nodes = [];
+    const shownBatches = new Set();
+    jobs.forEach((job) => {
+      if (job.batch_id && !shownBatches.has(job.batch_id)) {
+        const members = batchMembers(job.batch_id);
+        const batchHasActive = members.some((member) => member.state === 'queued' || member.state === 'running');
+        if (allowBatchCancellation || !batchHasActive) nodes.push(createBatchSummary(job.batch_id, allowBatchCancellation));
+        shownBatches.add(job.batch_id);
+      }
+      const card = createJobCard(job);
+      reconcileLogPanel(previousCards.get(job.id), card, restorations);
+      nodes.push(card);
+    });
+    return nodes;
+  };
+  const activeJobs = state.jobs
+    .filter((job) => job.state === 'queued' || job.state === 'running')
+    .reverse();
   const historyJobs = state.jobs.filter((job) => job.state === 'completed' || job.state === 'failed' || job.state === 'cancelled');
   const activeContainer = $('#active-jobs');
   const historyContainer = $('#history-jobs');
   const historySection = $('#history-section');
-  const activeCards = createCards(activeJobs);
+  const activeCards = createCards(activeJobs, true);
   if (activeCards.length) activeContainer.replaceChildren(...activeCards);
   else activeContainer.innerHTML = '<div class="empty queue-empty">No active or queued jobs.</div>';
-  historyContainer.replaceChildren(...createCards(historyJobs));
+  historyContainer.replaceChildren(...createCards(historyJobs, false));
   historySection.hidden = historyJobs.length === 0;
   restorations.forEach(({ id, details, log, snapshot }) => {
     if (details.open) {
@@ -477,9 +651,16 @@ async function loadJobs() {
     const jobs = Array.isArray(data?.jobs) ? data.jobs : [];
     state.jobs = jobs.map(normalizeJob).filter((job) => job !== null);
     renderJobs();
-    if (state.jobs.some((job) => job.source_replaced && !previouslyReplaced.has(job.id))) {
-      await loadFiles(state.currentPath);
-      clearMovieSelection();
+    const newlyReplaced = state.jobs.filter((job) => job.source_replaced && !previouslyReplaced.has(job.id));
+    if (newlyReplaced.length) {
+      newlyReplaced.forEach((job) => state.selections.delete(selectionKey(job.root_id, job.path)));
+      if (newlyReplaced.some((job) => state.selected?.root_id === job.root_id && state.selected?.path === job.path)) {
+        state.selected = null;
+        $('#details-hint').textContent = 'Select a movie to inspect it.';
+        $('#movie-details').innerHTML = '<div class="details-placeholder">No movie selected</div>';
+      }
+      if (newlyReplaced.some((job) => job.root_id === state.rootID)) await loadFiles(state.currentPath);
+      else renderSelectionControls();
     }
   } catch (error) {
     showNotice(error.message);
@@ -495,12 +676,40 @@ async function cancelJob(id) {
   }
 }
 
+async function cancelBatch(batchID) {
+  const members = batchMembers(batchID);
+  const hasRunning = members.some((job) => job.state === 'running');
+  const message = hasRunning
+    ? 'Cancel the running movie and all remaining queued movies in this batch?'
+    : 'Cancel all remaining movies in this batch?';
+  if (!window.confirm(message)) return;
+  try {
+    await api(`/api/batches/${encodeURIComponent(batchID)}/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cancel_running: hasRunning }),
+    });
+    await loadJobs();
+  } catch (error) {
+    showNotice(error.message);
+  }
+}
+
 $('#file-list').addEventListener('click', (event) => {
-  const row = event.target.closest('.file-row');
-  if (!row) return;
-  if (row.dataset.type === 'directory') loadFiles(row.dataset.path);
-  else selectMovie(row.dataset.path);
+  const directory = event.target.closest('.file-row.directory');
+  if (directory) {
+    loadFiles(directory.dataset.path);
+    return;
+  }
+  const inspect = event.target.closest('.file-inspect');
+  if (inspect) selectMovie(inspect.dataset.path);
 });
+$('#file-list').addEventListener('change', (event) => {
+  const checkbox = event.target.closest('[data-select-path]');
+  if (checkbox) setMovieSelected(checkbox.dataset.selectPath, checkbox.checked);
+});
+$('#select-visible').addEventListener('click', selectAllVisible);
+$('#clear-selection').addEventListener('click', clearSelections);
 $('#breadcrumbs').addEventListener('click', (event) => {
   const crumb = event.target.closest('button');
   if (crumb) loadFiles(crumb.dataset.path);
@@ -519,7 +728,12 @@ $('#jobs').addEventListener('click', (event) => {
     return;
   }
   const button = event.target.closest('[data-cancel]');
-  if (button) cancelJob(button.dataset.cancel);
+  if (button) {
+    cancelJob(button.dataset.cancel);
+    return;
+  }
+  const batchButton = event.target.closest('[data-cancel-batch]');
+  if (batchButton) cancelBatch(batchButton.dataset.cancelBatch);
 });
 $('#jobs').addEventListener('toggle', (event) => {
   const details = event.target.closest('details[data-job-logs]');
