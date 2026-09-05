@@ -35,6 +35,7 @@ type createJobRequest struct {
 	KeepAllAudio     bool   `json:"keep_all_audio"`
 	ExactMB          int64  `json:"exact_mb"`
 	RequestedEncoder string `json:"requested_encoder"`
+	ReplaceOriginal  bool   `json:"replace_original"`
 }
 
 func NewServer(roots *RootRegistry, shrinkrayBin, stateDir, version string) (*Server, error) {
@@ -173,7 +174,7 @@ func (s *Server) jobsEndpoint(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid job request")
 			return
 		}
-		job, err := s.jobs.Submit(request.RootID, request.Path, request.Preset, request.Container, request.KeepAllAudio, request.ExactMB, request.RequestedEncoder)
+		job, err := s.jobs.SubmitWithReplace(request.RootID, request.Path, request.Preset, request.Container, request.KeepAllAudio, request.ExactMB, request.ReplaceOriginal, request.RequestedEncoder)
 		if err != nil {
 			status := http.StatusBadRequest
 			if errors.Is(err, ErrJobPersistence) {

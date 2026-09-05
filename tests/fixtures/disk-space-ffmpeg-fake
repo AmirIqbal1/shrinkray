@@ -18,7 +18,7 @@ if [ "$output" != "/dev/null" ]; then
   printf 'temporary encoded output\n' > "$output"
 fi
 printf 'out_time_us=1000000\nspeed=1.0x\nprogress=continue\n'
-if [ "${SHRINKRAY_TEST_DISK_MODE:-}" = "critical" ]; then
+if [ "${SHRINKRAY_TEST_DISK_MODE:-}" = "critical" ] || [ "${SHRINKRAY_TEST_DISK_MODE:-}" = "cancel" ]; then
   sleep 30
 fi
 printf 'out_time_us=10000000\nspeed=1.0x\nprogress=end\n'

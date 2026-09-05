@@ -24,6 +24,8 @@ const (
 
 const interruptedByRestartMessage = "Shrinkray restarted while this encode was running. The source file was left untouched. Start a new job to retry the encode."
 
+const interruptedReplacementAttentionMessage = "Shrinkray restarted during a safe replacement transaction. Ambiguous files were left in place; inspect the recovery log before retrying."
+
 var ErrJobPersistence = errors.New("job persistence failed")
 
 type persistedJobState struct {
@@ -232,9 +234,14 @@ func (m *JobManager) restore(state persistedJobState) bool {
 		job := cloneJob(restored, recoveryTime)
 		job.cancel = nil
 		job.outputAbs = ""
+		job.reservationKeys = nil
 		job.lastProgressPersist = time.Time{}
 		if job.Settings.RequestedEncoder == "" {
 			job.Settings.RequestedEncoder = "software"
+			changed = true
+		}
+		if job.Settings.ReplaceOriginal && job.TransactionID == "" && job.State == StateQueued {
+			job.TransactionID = newTransactionID(job.ID)
 			changed = true
 		}
 		if job.Logs == nil {
@@ -250,7 +257,10 @@ func (m *JobManager) restore(state persistedJobState) bool {
 
 		switch job.State {
 		case StateCompleted, StateFailed, StateCancelled:
-			// Terminal jobs are restored exactly as history.
+			if job.Settings.ReplaceOriginal && !job.SourceReplaced && job.TransactionID != "" {
+				m.recoverReplacementArtifacts(job)
+				changed = true
+			}
 		case StateRunning:
 			m.recoverInterruptedJob(job, recoveryTime)
 			changed = true
@@ -266,7 +276,7 @@ func (m *JobManager) restore(state persistedJobState) bool {
 		m.jobs = append(m.jobs, job)
 		if job.State == StateQueued {
 			m.pending = append(m.pending, job)
-			m.reserved[job.outputAbs] = true
+			reservePaths(m.reserved, job.reservationKeys)
 		}
 	}
 	if maxID > m.nextID {
@@ -279,19 +289,28 @@ func (m *JobManager) restore(state persistedJobState) bool {
 }
 
 func (m *JobManager) restoreQueuedJob(job *Job, recoveryTime time.Time) error {
+	if job.Settings.ReplaceOriginal && !validTransactionID(job.TransactionID) {
+		return errors.New("Queued replacement job has an invalid transaction identifier.")
+	}
 	output, err := m.expectedOutput(job)
 	if err != nil {
 		return fmt.Errorf("Queued job could not be restored: %w", err)
 	}
-	if m.reserved[output] {
+	mediaRoot, _ := m.roots.Get(job.RootID)
+	source, _, _ := mediaRoot.Root.ResolveVideo(job.Path)
+	keys := replacementReservationKeys(source, output, job.Settings.ReplaceOriginal)
+	if reservedPath(m.reserved, keys) {
 		return errors.New("Queued job could not be restored because another queued job targets the same output.")
 	}
-	if _, err := os.Lstat(output); err == nil {
-		return errors.New("Queued job was not restarted because its intended output already exists.")
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return errors.New("Queued job was not restarted because its intended output could not be inspected.")
+	if output != source {
+		if _, err := os.Lstat(output); err == nil {
+			return errors.New("Queued job was not restarted because its intended output already exists.")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return errors.New("Queued job was not restarted because its intended output could not be inspected.")
+		}
 	}
 	job.outputAbs = output
+	job.reservationKeys = keys
 	job.State = StateQueued
 	job.Stage = "Waiting"
 	job.StartedAt = nil
@@ -317,7 +336,7 @@ func (m *JobManager) expectedOutput(job *Job) (string, error) {
 	if clean != filepath.ToSlash(filepath.Clean(job.Path)) {
 		return "", errors.New("saved source path is invalid")
 	}
-	output := outputPath(source, job.Settings.Container)
+	output := intendedOutputPath(source, job.Settings.Container, job.Settings.ReplaceOriginal)
 	relativeOutput, err := filepathRelSlash(mediaRoot.Root.Path(), output)
 	if err != nil || relativeOutput != job.OutputPath {
 		return "", errors.New("saved output path does not match the expected Shrinkray output")
@@ -339,6 +358,15 @@ func (m *JobManager) recoverInterruptedJob(job *Job, recoveryTime time.Time) {
 	job.FinishedAt = &recoveryTime
 	job.ETASeconds = nil
 	job.ETAIsEstimate = false
+	if job.Settings.ReplaceOriginal {
+		m.recoverReplacementArtifacts(job)
+		if job.OriginalKept {
+			job.Failure = "Shrinkray restarted during replacement recovery. The original was kept; inspect the recovery log before retrying."
+		} else {
+			job.Failure = interruptedReplacementAttentionMessage
+		}
+		return
+	}
 	if output, err := m.expectedOutput(job); err == nil {
 		part := output + ".part"
 		if cleanupErr := removeInterruptedPart(m.roots, job.RootID, output, part); cleanupErr != nil {
@@ -347,6 +375,125 @@ func (m *JobManager) recoverInterruptedJob(job *Job, recoveryTime time.Time) {
 	} else {
 		appendRecoveryLog(job, "!!  Interrupted temporary output was left in place because its path could not be verified: "+err.Error())
 	}
+}
+
+func (m *JobManager) recoverReplacementArtifacts(job *Job) {
+	source, err := m.savedSourcePath(job)
+	if err != nil {
+		appendRecoveryLog(job, "!!  Replacement recovery attention required; saved source path could not be verified: "+err.Error())
+		return
+	}
+	output := intendedOutputPath(source, job.Settings.Container, true)
+	if !validTransactionID(job.TransactionID) {
+		appendRecoveryLog(job, "!!  Replacement recovery attention required; the saved job has no valid transaction identifier.")
+		return
+	}
+	temporary := filepath.Join(filepath.Dir(source), "."+filepath.Base(source)+".shrinkray-replace-"+job.TransactionID+".part."+job.Settings.Container)
+	backup := filepath.Join(filepath.Dir(source), "."+filepath.Base(source)+".shrinkray-backup-"+job.TransactionID)
+
+	backupInfo, backupErr := os.Lstat(backup)
+	if backupErr == nil {
+		if !backupInfo.Mode().IsRegular() || backupInfo.Mode()&os.ModeSymlink != 0 {
+			appendRecoveryLog(job, "!!  Replacement recovery attention required; backup is not a regular file: "+backup)
+			return
+		}
+		sourceInfo, sourceErr := os.Lstat(source)
+		if sourceErr == nil && sourceInfo.Mode().IsRegular() && sourceInfo.Mode()&os.ModeSymlink == 0 && os.SameFile(sourceInfo, backupInfo) {
+			if err := os.Remove(backup); err != nil {
+				appendRecoveryLog(job, "!!  Could not remove proven-redundant replacement backup: "+backup+": "+err.Error())
+			} else {
+				appendRecoveryLog(job, "==> Recovered an interrupted transaction; the original remained in place and its redundant hard-link backup was removed.")
+			}
+			job.OriginalKept = true
+			removeExactReplacementTemp(job, source, temporary)
+			clearRecoveredTransactionIfClean(job, temporary, backup)
+			return
+		}
+		appendRecoveryLog(job, "!!  Replacement recovery attention required; recoverable original backup was left at: "+backup)
+		return
+	}
+	if !errors.Is(backupErr, os.ErrNotExist) {
+		appendRecoveryLog(job, "!!  Replacement recovery attention required; backup could not be inspected: "+backup+": "+backupErr.Error())
+		return
+	}
+
+	if sourceInfo, sourceErr := os.Lstat(source); sourceErr == nil && sourceInfo.Mode().IsRegular() && sourceInfo.Mode()&os.ModeSymlink == 0 {
+		if output == source {
+			if sourceInfo.Size() != job.OriginalSize {
+				appendRecoveryLog(job, "!!  Replacement recovery attention required; the source path exists but its size does not prove whether replacement completed: "+source)
+				return
+			}
+			job.OriginalKept = true
+		} else {
+			job.OriginalKept = true
+			if _, finalErr := os.Lstat(output); finalErr == nil {
+				appendRecoveryLog(job, "!!  Replacement recovery attention required; both source and expected final target were left in place: "+output)
+				return
+			}
+		}
+		removeExactReplacementTemp(job, source, temporary)
+		clearRecoveredTransactionIfClean(job, temporary, backup)
+		return
+	}
+	if output != source {
+		if finalInfo, finalErr := os.Lstat(output); finalErr == nil && finalInfo.Mode().IsRegular() && finalInfo.Mode()&os.ModeSymlink == 0 {
+			job.FinalPath = job.OutputPath
+			appendRecoveryLog(job, "!!  Replacement recovery attention required; source is absent and the final target was left in place: "+output)
+			return
+		}
+	}
+	appendRecoveryLog(job, "!!  Replacement recovery attention required; Shrinkray could not prove a safe completed outcome.")
+}
+
+func (m *JobManager) savedSourcePath(job *Job) (string, error) {
+	mediaRoot, err := m.roots.Get(job.RootID)
+	if err != nil {
+		return "", errors.New("configured media root is unavailable")
+	}
+	if filepath.IsAbs(job.Path) || containsDotDot(job.Path) {
+		return "", errors.New("saved source path is invalid")
+	}
+	clean := filepath.Clean(job.Path)
+	if clean == "." || filepath.ToSlash(clean) != filepath.ToSlash(job.Path) {
+		return "", errors.New("saved source path is invalid")
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Join(mediaRoot.Root.Path(), filepath.Dir(clean)))
+	if err != nil {
+		return "", errors.New("saved source directory is unavailable")
+	}
+	if _, err := filepathRelSlash(mediaRoot.Root.Path(), parent); err != nil {
+		return "", errors.New("saved source directory is outside the configured media root")
+	}
+	return filepath.Join(parent, filepath.Base(clean)), nil
+}
+
+func removeExactReplacementTemp(job *Job, source, temporary string) {
+	info, err := os.Lstat(temporary)
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		appendRecoveryLog(job, "!!  Interrupted replacement temporary output was left in place because it was not a regular Shrinkray-owned file: "+temporary)
+		return
+	}
+	expected := filepath.Join(filepath.Dir(source), "."+filepath.Base(source)+".shrinkray-replace-"+job.TransactionID+".part."+job.Settings.Container)
+	if temporary != expected {
+		appendRecoveryLog(job, "!!  Interrupted replacement temporary output was left in place because its path could not be verified: "+temporary)
+		return
+	}
+	if err := os.Remove(temporary); err != nil {
+		appendRecoveryLog(job, "!!  Could not remove interrupted replacement temporary output: "+temporary+": "+err.Error())
+	}
+}
+
+func clearRecoveredTransactionIfClean(job *Job, temporary, backup string) {
+	if _, err := os.Lstat(temporary); !errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	if _, err := os.Lstat(backup); !errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	job.TransactionID = ""
 }
 
 func removeInterruptedPart(roots *RootRegistry, rootID, output, part string) error {

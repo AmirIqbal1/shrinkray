@@ -45,6 +45,7 @@
                 <label>Audio<select id="audio"><option value="first">First audio track</option><option value="all">Keep all audio tracks</option></select></label>
                 <label>Encoder<select id="encoder"><option value="auto">Auto — fastest available</option><option value="software">Software — best compression</option></select></label>
               </div>
+              <label class="replace-original-option"><input id="replace-original" type="checkbox"><span><strong>Replace original after successful shrink</strong><small>The source is kept until the new file has completed and passed validation.</small></span></label>
               <div class="target-summary"><span>Calculated target</span><strong id="target-size">—</strong></div>
               <button class="primary" type="submit">Add to queue <span aria-hidden="true">→</span></button>
             </fieldset>

@@ -53,6 +53,12 @@ fi
 if [ "$backend" = software ] && [ -n "${SHRINKRAY_TEST_PART_PATH:-}" ] && [ -e "$SHRINKRAY_TEST_PART_PATH" ]; then
   printf 'part leaked into software fallback\n' >"${SHRINKRAY_TEST_FALLBACK_LEAK:?fallback leak marker required}"
 fi
+if [ "$backend" = software ] && [ "$output" != /dev/null ] && [ "${SHRINKRAY_TEST_EXPECT_OUTPUT_CLEAN:-false}" = true ] && [ -e "$output" ]; then
+  printf 'replacement temp leaked into software fallback\n' >"${SHRINKRAY_TEST_FALLBACK_LEAK:?fallback leak marker required}"
+fi
+if [ "$backend" = software ] && [ -n "${SHRINKRAY_TEST_SOURCE_PATH:-}" ] && ! grep -q '^original movie' "${SHRINKRAY_TEST_SOURCE_PATH}"; then
+  printf 'source changed before software fallback\n' >"${SHRINKRAY_TEST_FALLBACK_LEAK:?fallback leak marker required}"
+fi
 if [ "$output" != /dev/null ]; then
   printf 'encoded output\n' >"$output"
 fi

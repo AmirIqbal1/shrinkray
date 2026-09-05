@@ -14,8 +14,11 @@ ENCODER="auto"
 CONTAINER="mkv"
 KEEP_ALL_AUDIO=false
 OUTPUT=""
+CUSTOM_OUTPUT=false
 DRY_RUN=false
 FORCE=false
+REPLACE_ORIGINAL=false
+TRANSACTION_ID=""
 MACHINE_PROGRESS=false
 BATCH_DIR=""
 RECURSIVE=false
@@ -28,6 +31,9 @@ ACTIVE_ENCODER_PID=""
 ACTIVE_MONITOR_PID=""
 ACTIVE_OUTPUT_DIR=""
 ACTIVE_PROBE_DIR=""
+ACTIVE_BACKUP=""
+IN_REPLACEMENT_TRANSACTION=false
+PENDING_SIGNAL=""
 CRITICAL_DISK_TRIGGERED=false
 ENCODER_WORKING_ALLOWANCE_BYTES=$((512 * 1024 * 1024))
 MINIMUM_SAFETY_RESERVE_BYTES=$((2 * 1024 * 1024 * 1024))
@@ -57,6 +63,7 @@ OPTIONS:
   --container <fmt>   mkv | mp4                              (default: mkv)
   --keep-all-audio    Keep every audio track (default: first track only)
   --output <path>     Output path (default: <name>.shrunk.<container>)
+  --replace-original  Replace the source only after successful validation
   --batch <dir>       Process video files in a directory
   --recursive         Include subdirectories in batch mode
   --dry-run           Show what would happen without encoding
@@ -70,6 +77,7 @@ EXAMPLES:
   shrinkray guided --dry-run
   shrinkray movie.mkv
   shrinkray movie.mkv --size 700 --quality best
+  shrinkray movie.mkv --size 1200 --replace-original
   shrinkray --batch ~/Movies --recursive --size 500
   shrinkray doctor
   shrinkray capabilities --json
@@ -104,6 +112,10 @@ cleanup_active() {
 
 handle_signal() {
   local exit_code="$1"
+  if [ "$IN_REPLACEMENT_TRANSACTION" = true ]; then
+    PENDING_SIGNAL="$exit_code"
+    return
+  fi
   if [ -n "$ACTIVE_TEMP" ]; then
     warn "Encoding interrupted; removing the temporary output."
   else
@@ -449,6 +461,14 @@ default_output_for() {
   printf '%s/%s.shrunk.%s\n' "$dir" "$base" "$CONTAINER"
 }
 
+replacement_output_for() {
+  local input="$1"
+  local dir base
+  dir="$(dirname -- "$input")"
+  base="$(basename -- "${input%.*}")"
+  printf '%s/%s.%s\n' "$dir" "$base" "$CONTAINER"
+}
+
 guided_prompt() {
   local prompt="$1"
   REPLY=""
@@ -654,7 +674,39 @@ guided_mode() {
     esac
   done
 
-  OUTPUT="$(default_output_for "$input")"
+  while true; do
+    printf '\nOutput\n'
+    printf '  1. Keep original — create a separate .shrunk file (recommended)\n'
+    printf '  2. Replace original after successful validation\n'
+    if ! guided_prompt "Choice [1]: "; then
+      warn "No input received; guided mode cancelled."
+      return 2
+    fi
+    case "$REPLY" in
+      ""|1) REPLACE_ORIGINAL=false; break ;;
+      2)
+        REPLACE_ORIGINAL=true
+        printf '\nWARNING: The original movie will only be removed after the new encode has completed\n'
+        printf 'and passed validation.\n'
+        if ! guided_prompt "Type YES to confirm replacement: "; then
+          warn "No input received; guided mode cancelled."
+          return 2
+        fi
+        if [ "$REPLY" != "YES" ]; then
+          warn "Replacement was not confirmed; guided mode cancelled."
+          return 2
+        fi
+        break
+        ;;
+      *) warn "Choose 1 or 2." ;;
+    esac
+  done
+
+  if [ "$REPLACE_ORIGINAL" = true ]; then
+    OUTPUT="$(replacement_output_for "$input")"
+  else
+    OUTPUT="$(default_output_for "$input")"
+  fi
   printf '\nReady to shrink\n'
   printf '  Input: %s\n' "$input"
   printf '  Original size: %s MB\n' "$original_mb"
@@ -662,6 +714,7 @@ guided_mode() {
   printf '  Quality: %s\n' "$QUALITY"
   printf '  Container: %s\n' "${CONTAINER^^}"
   printf '  Audio handling: %s\n' "$audio_description"
+  printf '  Replace original: %s\n' "$REPLACE_ORIGINAL"
   printf '  Output path: %s\n' "$OUTPUT"
 
   while true; do
@@ -692,6 +745,235 @@ validate_output() {
   [ "$stream_info" = "video" ] || return 1
   ffprobe -v error -show_entries format=duration -of default=nw=1 "$output" \
     >/dev/null 2>&1
+}
+
+duration_within_tolerance() {
+  local source_duration="$1"
+  local output_duration="$2"
+  awk -v source="$source_duration" -v output="$output_duration" 'BEGIN {
+    if (source <= 0 || output <= 0) exit 1
+    difference = source - output
+    if (difference < 0) difference = -difference
+    tolerance = source * 0.005
+    if (tolerance < 2) tolerance = 2
+    exit !(difference <= tolerance)
+  }'
+}
+
+probe_duration() {
+  ffprobe -v error -show_entries format=duration -of csv=p=0 "$1" 2>/dev/null
+}
+
+validate_replacement_output() {
+  local output="$1"
+  local source_duration="$2"
+  local source_size="$3"
+  local output_duration output_size stream_info
+  say "Validating replacement output..."
+  [ -e "$output" ] || { warn "Encoded output does not exist; original was kept."; return 1; }
+  if [ ! -f "$output" ] || [ -L "$output" ]; then
+    warn "Encoded output is not a regular file; original was kept."
+    return 1
+  fi
+  [ -s "$output" ] || { warn "Encoded output is empty; original was kept."; return 1; }
+  stream_info="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$output" 2>/dev/null)" || {
+    warn "ffprobe could not read the encoded output; original was kept."
+    return 1
+  }
+  [ "$stream_info" = "video" ] || { warn "Encoded output has no video stream; original was kept."; return 1; }
+  output_duration="$(probe_duration "$output")" || {
+    warn "Encoded output duration is unreadable; original was kept."
+    return 1
+  }
+  [[ "$output_duration" =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+    warn "Encoded output duration is unreadable; original was kept."
+    return 1
+  }
+  if ! duration_within_tolerance "$source_duration" "$output_duration"; then
+    warn "Encoded output duration does not match the source; original was kept."
+    return 1
+  fi
+  output_size="$(file_size_bytes "$output")" || return 1
+  if [ "$output_size" -ge "$source_size" ]; then
+    warn "Encoded file is not smaller than the source; original was kept."
+    return 1
+  fi
+}
+
+replacement_artifact_paths() {
+  local input="$1"
+  local token="$2"
+  local dir base
+  dir="$(dirname -- "$input")"
+  base="$(basename -- "$input")"
+  ACTIVE_TEMP="${dir}/.${base}.shrinkray-replace-${token}.part.${CONTAINER}"
+  ACTIVE_BACKUP="${dir}/.${base}.shrinkray-backup-${token}"
+}
+
+new_cli_transaction_id() {
+  local random_id
+  random_id="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d '[:space:]')" || random_id=""
+  if [[ "$random_id" =~ ^[0-9a-f]{32}$ ]]; then
+    printf '%s\n' "$random_id"
+  else
+    printf '%s-%s-%s\n' "$$" "$RANDOM" "$RANDOM"
+  fi
+}
+
+preserve_replacement_mode() {
+  local input="$1"
+  local output="$2"
+  local mode
+  mode="$(stat -c '%a' -- "$input")" || return 1
+  chmod "$mode" -- "$output"
+}
+
+same_file_identity() {
+  [ -f "$1" ] && [ ! -L "$1" ] && [ -f "$2" ] && [ ! -L "$2" ] &&
+    [ "$(stat -c '%d:%i' -- "$1")" = "$(stat -c '%d:%i' -- "$2")" ]
+}
+
+rollback_same_container() {
+  local source="$1"
+  local backup="$2"
+  warn "Safe replacement did not complete; restoring the original."
+  if same_file_identity "$source" "$backup"; then
+    if rm -f -- "$backup"; then
+      ACTIVE_BACKUP=""
+      warn "The original movie remained in place."
+      return 0
+    fi
+    warn "ROLLBACK FAILED. The recoverable original backup was left at: $backup"
+    return 1
+  fi
+  if mv -f -- "$backup" "$source" && [ -f "$source" ] && [ ! -L "$source" ]; then
+    ACTIVE_BACKUP=""
+    warn "The original movie was restored."
+    return 0
+  fi
+  warn "ROLLBACK FAILED. The recoverable original backup was left at: $backup"
+  warn "Do not remove that backup until the original movie has been recovered."
+  return 1
+}
+
+replace_same_container() {
+  local source="$1"
+  local temp="$2"
+  local source_duration="$3"
+  local source_size="$4"
+  local source_identity="$5"
+  local backup="$ACTIVE_BACKUP"
+
+  if [ "$(stat -c '%d:%i:%s' -- "$source" 2>/dev/null || true)" != "$source_identity" ]; then
+    warn "Source changed while encoding; original was kept."
+    return 1
+  fi
+  if [ -e "$backup" ] || [ -L "$backup" ]; then
+    warn "Shrinkray replacement backup already exists; original was kept: $backup"
+    return 1
+  fi
+  IN_REPLACEMENT_TRANSACTION=true
+  if ! ln -P -- "$source" "$backup"; then
+    IN_REPLACEMENT_TRANSACTION=false
+    warn "Could not create the required hard-link backup; original was kept."
+    return 1
+  fi
+  if ! same_file_identity "$source" "$backup"; then
+    warn "Could not verify the required hard-link backup; original was kept."
+    if rm -f -- "$backup"; then
+      ACTIVE_BACKUP=""
+    else
+      warn "The unverified backup was left for recovery attention at: $backup"
+    fi
+    IN_REPLACEMENT_TRANSACTION=false
+    return 1
+  fi
+
+  if [ -n "$PENDING_SIGNAL" ]; then
+    local pending_exit="$PENDING_SIGNAL"
+    if rm -f -- "$backup"; then
+      ACTIVE_BACKUP=""
+    else
+      warn "Cancellation kept the source and left its redundant backup at: $backup"
+    fi
+    PENDING_SIGNAL=""
+    IN_REPLACEMENT_TRANSACTION=false
+    handle_signal "$pending_exit"
+  fi
+
+  if ! mv -f -- "$temp" "$source"; then
+    rollback_same_container "$source" "$backup" || true
+    IN_REPLACEMENT_TRANSACTION=false
+    return 1
+  fi
+  ACTIVE_TEMP=""
+  if ! validate_replacement_output "$source" "$source_duration" "$source_size"; then
+    rollback_same_container "$source" "$backup" || true
+    IN_REPLACEMENT_TRANSACTION=false
+    return 1
+  fi
+  if ! rm -f -- "$backup"; then
+    IN_REPLACEMENT_TRANSACTION=false
+    warn "Replacement succeeded, but the recoverable original backup could not be removed: $backup"
+    return 1
+  fi
+  ACTIVE_BACKUP=""
+  IN_REPLACEMENT_TRANSACTION=false
+  if [ -n "$PENDING_SIGNAL" ]; then
+    warn "Cancellation arrived after final replacement began; the safe replacement completed."
+    PENDING_SIGNAL=""
+  fi
+  return 0
+}
+
+replace_different_container() {
+  local source="$1"
+  local temp="$2"
+  local final="$3"
+  local source_duration="$4"
+  local source_size="$5"
+  local source_identity="$6"
+
+  if [ "$(stat -c '%d:%i:%s' -- "$source" 2>/dev/null || true)" != "$source_identity" ]; then
+    warn "Source changed while encoding; original was kept."
+    return 1
+  fi
+  if [ -e "$final" ] || [ -L "$final" ]; then
+    warn "Replacement target already exists; original was kept: $final"
+    return 1
+  fi
+  IN_REPLACEMENT_TRANSACTION=true
+  if ! mv -n -- "$temp" "$final" || [ -e "$temp" ]; then
+    IN_REPLACEMENT_TRANSACTION=false
+    warn "Could not place the validated encode without overwriting a target; original was kept."
+    return 1
+  fi
+  ACTIVE_TEMP=""
+  if ! validate_replacement_output "$final" "$source_duration" "$source_size"; then
+    if mv -- "$final" "$temp"; then
+      ACTIVE_TEMP="$temp"
+    else
+      warn "The original remains safe; inspect the new artifact at: $final"
+    fi
+    IN_REPLACEMENT_TRANSACTION=false
+    return 1
+  fi
+  if [ "$(stat -c '%d:%i:%s' -- "$source" 2>/dev/null || true)" != "$source_identity" ]; then
+    IN_REPLACEMENT_TRANSACTION=false
+    warn "Source changed during final placement; both files were kept."
+    return 1
+  fi
+  if ! rm -f -- "$source"; then
+    IN_REPLACEMENT_TRANSACTION=false
+    warn "The new file is valid, but the original could not be removed; both files were kept."
+    return 1
+  fi
+  IN_REPLACEMENT_TRANSACTION=false
+  if [ -n "$PENDING_SIGNAL" ]; then
+    warn "Cancellation arrived after final replacement began; the safe replacement completed."
+    PENDING_SIGNAL=""
+  fi
+  return 0
 }
 
 run_software_hevc_encode() {
@@ -800,16 +1082,30 @@ process_file() {
   local codec="$4"
   local duration duration_int total_kbit total_kbps video_kbps
   local audio_map orig_bytes orig_mb target_bytes new_bytes new_mb saved_pct
-  local answer
+  local answer same_container=false transaction_token source_identity
   local -a mapping_args
 
   [ -f "$input" ] || { warn "File not found: $input"; return 1; }
+  if [ "$REPLACE_ORIGINAL" = true ] && [ -L "$input" ]; then
+    warn "Replacement source must not be a symbolic link: $input"
+    return 1
+  fi
   [ -d "$(dirname -- "$output")" ] || { warn "Output directory does not exist: $(dirname -- "$output")"; return 1; }
   [ ! -d "$output" ] || { warn "Output path is a directory: $output"; return 1; }
 
-  if [ "$(canonical_path "$input")" = "$(canonical_path "$output")" ]; then
+  if [ "$(canonical_path "$input")" = "$(canonical_path "$output")" ] && [ "$REPLACE_ORIGINAL" = false ]; then
     warn "Input and output refer to the same file; refusing to replace the source."
     return 1
+  fi
+  if [ "$(canonical_path "$input")" = "$(canonical_path "$output")" ]; then
+    same_container=true
+  fi
+
+  if [ "$REPLACE_ORIGINAL" = true ] && [ "$same_container" = false ]; then
+    if [ -e "$output" ] || [ -L "$output" ]; then
+      warn "Replacement target already exists; original was kept: $output"
+      return 1
+    fi
   fi
 
   duration="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$input" 2>/dev/null || true)"
@@ -830,6 +1126,7 @@ process_file() {
   fi
 
   orig_bytes="$(file_size_bytes "$input")"
+  source_identity="$(stat -c '%d:%i:%s' -- "$input")" || return 1
   orig_mb="$(human_size_mb "$orig_bytes")"
   target_bytes=$(( target_mb * 1024 * 1024 ))
   if [ "$target_bytes" -ge "$orig_bytes" ]; then
@@ -845,6 +1142,9 @@ process_file() {
   say "Quality: $QUALITY"
   say "Target:  ${target_mb} MB (currently ${orig_mb} MB)"
   say "Output:  $output"
+  if [ "$REPLACE_ORIGINAL" = true ]; then
+    say "Mode:    replace original after successful validation"
+  fi
   if [ "$CONTAINER" = "mp4" ]; then
     say "Note: MP4 output drops subtitles; use MKV to retain them."
   fi
@@ -854,7 +1154,7 @@ process_file() {
     return 0
   fi
 
-  if [ -e "$output" ] && [ "$FORCE" = false ]; then
+  if [ "$REPLACE_ORIGINAL" = false ] && [ -e "$output" ] && [ "$FORCE" = false ]; then
     if ! read -r -p "Output already exists. Replace it? [y/N] " answer; then
       warn "No response available; skipping $(basename -- "$input")."
       return 2
@@ -871,7 +1171,22 @@ process_file() {
 
   cleanup_active
   CRITICAL_DISK_TRIGGERED=false
-  ACTIVE_TEMP="${output}.part"
+  if [ "$REPLACE_ORIGINAL" = true ]; then
+    transaction_token="$TRANSACTION_ID"
+    if [ -z "$transaction_token" ]; then
+      transaction_token="$(new_cli_transaction_id)"
+    fi
+    replacement_artifact_paths "$input" "$transaction_token"
+    if [ -e "$ACTIVE_TEMP" ] || [ -L "$ACTIVE_TEMP" ] || [ -e "$ACTIVE_BACKUP" ] || [ -L "$ACTIVE_BACKUP" ]; then
+      warn "A Shrinkray replacement artifact already exists; original was kept."
+      warn "Recovery attention required: ${ACTIVE_BACKUP}"
+      ACTIVE_TEMP=""
+      ACTIVE_BACKUP=""
+      return 1
+    fi
+  else
+    ACTIVE_TEMP="${output}.part"
+  fi
   ACTIVE_WORKDIR="$(mktemp -d)"
   ACTIVE_OUTPUT_DIR="$(dirname -- "$output")"
   rm -f -- "$ACTIVE_TEMP"
@@ -935,18 +1250,39 @@ process_file() {
     fi
   fi
 
-  if ! validate_output "$ACTIVE_TEMP"; then
-    warn "ffprobe could not validate the completed encode; the final output was not changed."
-    cleanup_active
-    return 1
-  fi
+  if [ "$REPLACE_ORIGINAL" = true ]; then
+    if ! validate_replacement_output "$ACTIVE_TEMP" "$duration" "$orig_bytes"; then
+      cleanup_active
+      return 1
+    fi
+    if ! preserve_replacement_mode "$input" "$ACTIVE_TEMP"; then
+      warn "Could not preserve source permissions; original was kept."
+      cleanup_active
+      return 1
+    fi
+    if [ "$same_container" = true ]; then
+      if ! replace_same_container "$input" "$ACTIVE_TEMP" "$duration" "$orig_bytes" "$source_identity"; then
+        cleanup_active
+        return 1
+      fi
+    elif ! replace_different_container "$input" "$ACTIVE_TEMP" "$output" "$duration" "$orig_bytes" "$source_identity"; then
+      cleanup_active
+      return 1
+    fi
+  else
+    if ! validate_output "$ACTIVE_TEMP"; then
+      warn "ffprobe could not validate the completed encode; the final output was not changed."
+      cleanup_active
+      return 1
+    fi
 
-  if ! mv -f -- "$ACTIVE_TEMP" "$output"; then
-    warn "Could not move the validated encode into place: $output"
-    cleanup_active
-    return 1
+    if ! mv -f -- "$ACTIVE_TEMP" "$output"; then
+      warn "Could not move the validated encode into place: $output"
+      cleanup_active
+      return 1
+    fi
+    ACTIVE_TEMP=""
   fi
-  ACTIVE_TEMP=""
   rm -rf -- "$ACTIVE_WORKDIR"
   ACTIVE_WORKDIR=""
 
@@ -959,6 +1295,13 @@ process_file() {
     say "Done: ${orig_mb} MB -> ${new_mb} MB (output is not smaller)"
   fi
 }
+
+if [ "${SHRINKRAY_SOURCE_ONLY:-0}" = 1 ]; then
+  if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+    return 0
+  fi
+  exit 0
+fi
 
 if [ "${1-}" = "capabilities" ]; then
   if [ "$#" -ne 2 ] || [ "$2" != "--json" ]; then
@@ -1043,6 +1386,13 @@ else
       --output)
         require_option_value "$1" "$#" "${2-}"
         OUTPUT="$2"
+        CUSTOM_OUTPUT=true
+        shift 2
+        ;;
+      --replace-original) REPLACE_ORIGINAL=true; shift ;;
+      --transaction-id)
+        require_option_value "$1" "$#" "${2-}"
+        TRANSACTION_ID="$2"
         shift 2
         ;;
       --batch)
@@ -1068,6 +1418,15 @@ case "$QUALITY" in fast|good|best) ;; *) die "--quality must be fast, good, or b
 case "$CODEC" in auto|hevc|av1) ;; *) die "--codec must be auto, hevc, or av1." ;; esac
 case "$ENCODER" in auto|software|qsv|vaapi|nvenc) ;; *) die "--encoder must be auto, software, qsv, vaapi, or nvenc." ;; esac
 case "$CONTAINER" in mkv|mp4) ;; *) die "--container must be mkv or mp4." ;; esac
+if [ "$REPLACE_ORIGINAL" = true ] && [ "$CUSTOM_OUTPUT" = true ]; then
+  die "--output cannot be used with --replace-original."
+fi
+if [ "$REPLACE_ORIGINAL" = false ] && [ -n "$TRANSACTION_ID" ]; then
+  die "--transaction-id is only valid with --replace-original."
+fi
+if [ -n "$TRANSACTION_ID" ] && { [ "${#TRANSACTION_ID}" -gt 128 ] || ! [[ "$TRANSACTION_ID" =~ ^[A-Za-z0-9._-]+$ ]]; }; then
+  die "--transaction-id contains unsafe characters."
+fi
 
 declare -a FFMPEG_PROGRESS_ARGS=(-stats)
 if [ "$MACHINE_PROGRESS" = true ]; then
@@ -1177,7 +1536,12 @@ if [ -n "$BATCH_DIR" ]; then
 
   say "Found ${#FILES[@]} source video file(s)."
   for file in "${FILES[@]}"; do
-    output_path="$(default_output_for "$file")"
+    if [ "$REPLACE_ORIGINAL" = true ]; then
+      output_path="$(replacement_output_for "$file")"
+      TRANSACTION_ID="batch-$(new_cli_transaction_id)"
+    else
+      output_path="$(default_output_for "$file")"
+    fi
     before_bytes="$(file_size_bytes "$file")"
     if process_file "$file" "$TARGET_MB" "$output_path" "$CODEC"; then
       SUCCESSFUL=$((SUCCESSFUL + 1))
@@ -1196,7 +1560,11 @@ if [ -n "$BATCH_DIR" ]; then
   done
 
   say ""
-  say "Batch summary: ${SUCCESSFUL} successful, ${FAILED} failed, ${SKIPPED} skipped."
+  if [ "$REPLACE_ORIGINAL" = true ]; then
+    say "Batch summary: ${SUCCESSFUL} safely replaced, ${FAILED} replacement failed, ${SKIPPED} skipped."
+  else
+    say "Batch summary: ${SUCCESSFUL} successful, ${FAILED} failed, ${SKIPPED} skipped."
+  fi
   if [ "$DRY_RUN" = false ] && [ "$SUCCESSFUL" -gt 0 ]; then
     say "Total size: $(human_size_mb "$TOTAL_ORIG") MB -> $(human_size_mb "$TOTAL_NEW") MB"
   fi
@@ -1204,7 +1572,11 @@ if [ -n "$BATCH_DIR" ]; then
 else
   INPUT="${INPUTS[0]}"
   [ -f "$INPUT" ] || die "File not found: $INPUT"
-  OUTPUT="${OUTPUT:-$(default_output_for "$INPUT")}"
+  if [ "$REPLACE_ORIGINAL" = true ]; then
+    OUTPUT="$(replacement_output_for "$INPUT")"
+  else
+    OUTPUT="${OUTPUT:-$(default_output_for "$INPUT")}"
+  fi
   if process_file "$INPUT" "$TARGET_MB" "$OUTPUT" "$CODEC"; then
     exit 0
   else

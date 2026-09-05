@@ -6,6 +6,7 @@ TEMP_DIR="$(mktemp -d)"
 INPUT_FILE="${TEMP_DIR}/synthetic-input.mkv"
 OUTPUT_FILE="${TEMP_DIR}/synthetic-output.mkv"
 MACHINE_OUTPUT_FILE="${TEMP_DIR}/synthetic-machine-output.mkv"
+REPLACE_INPUT_FILE="${TEMP_DIR}/synthetic-replace.mkv"
 MACHINE_PROGRESS_LOG="${TEMP_DIR}/machine-progress.log"
 
 cleanup() {
@@ -76,5 +77,23 @@ grep -q '^progress=end$' "$MACHINE_PROGRESS_LOG" || {
 
 printf 'Machine-progress smoke test passed.\n'
 
+printf 'Running real safe-replacement smoke test...\n'
+cp -- "$INPUT_FILE" "$REPLACE_INPUT_FILE"
+REPLACE_ORIGINAL_SIZE="$(stat -c %s -- "$REPLACE_INPUT_FILE")"
+bash "${ROOT_DIR}/shrinkray" "$REPLACE_INPUT_FILE" \
+  --size 1 --quality fast --encoder software --replace-original
+REPLACE_RESULT_SIZE="$(stat -c %s -- "$REPLACE_INPUT_FILE")"
+[ "$REPLACE_RESULT_SIZE" -lt "$REPLACE_ORIGINAL_SIZE" ] || {
+  printf 'smoke test: safe replacement was not smaller than its source\n' >&2
+  exit 1
+}
+ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$REPLACE_INPUT_FILE" | grep -qx video
+[ -z "$(find "$TEMP_DIR" -maxdepth 1 -name '.synthetic-replace.mkv.shrinkray-*' -print -quit)" ] || {
+  printf 'smoke test: successful safe replacement retained a transaction artifact\n' >&2
+  exit 1
+}
+printf 'Safe-replacement smoke test passed.\n'
+
 bash "${ROOT_DIR}/tests/disk-space-test.sh"
+bash "${ROOT_DIR}/tests/safe-replace-test.sh"
 bash "${ROOT_DIR}/tests/hardware-acceleration-test.sh"

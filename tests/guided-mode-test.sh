@@ -42,7 +42,7 @@ ffmpeg -y -hide_banner -loglevel error \
 
 printf 'Running guided mode with default choices...\n'
 GUIDED_OUTPUT="$(
-  printf '"%s"\n\n\n\n\n' "$INPUT_FILE" |
+  printf '"%s"\n\n\n\n\n\n' "$INPUT_FILE" |
     bash "${ROOT_DIR}/shrinkray" guided --dry-run 2>&1
 )"
 
@@ -51,6 +51,8 @@ assert_output_contains "Filename: guided input.mkv"
 assert_output_contains "Original size:"
 assert_output_contains "Target size:"
 assert_output_contains "Container: MKV"
+assert_output_contains "Keep original — create a separate .shrunk file (recommended)"
+assert_output_contains "Replace original: false"
 assert_output_contains "Dry run complete"
 
 [ ! -e "$OUTPUT_FILE" ] || {
@@ -61,5 +63,22 @@ assert_output_contains "Dry run complete"
   printf 'guided test: dry run created a .part file\n' >&2
   exit 1
 }
+
+printf 'Running guided replacement mode with explicit confirmation...\n'
+GUIDED_OUTPUT="$(
+  printf '"%s"\n\n\n\n2\nYES\n\n' "$INPUT_FILE" |
+    bash "${ROOT_DIR}/shrinkray" guided --dry-run 2>&1
+)"
+assert_output_contains "The original movie will only be removed after the new encode has completed"
+assert_output_contains "and passed validation."
+assert_output_contains "Type YES to confirm replacement"
+assert_output_contains "Replace original: true"
+assert_output_contains "Output path: ${INPUT_FILE}"
+assert_output_contains "Dry run complete"
+
+printf 'Checking that replacement requires affirmative confirmation...\n'
+GUIDED_OUTPUT="$(printf '"%s"\n\n\n\n2\nno\n' "$INPUT_FILE" | bash "${ROOT_DIR}/shrinkray" guided --dry-run 2>&1)"
+assert_output_contains "Replacement was not confirmed; guided mode cancelled."
+[ ! -e "$OUTPUT_FILE" ] || { printf 'guided test: rejected replacement created output\n' >&2; exit 1; }
 
 printf 'Guided mode test passed.\n'

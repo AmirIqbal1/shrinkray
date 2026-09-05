@@ -85,4 +85,28 @@ grep -q '^progress=end$' "${TEMP_DIR}/fallback.log"
 [ ! -e "$FALLBACK_LEAK" ] || { printf 'hardware test: partial output was not removed before fallback\n' >&2; exit 1; }
 grep -q '^original movie$' "$INPUT"
 
+REPLACE_INPUT="${TEMP_DIR}/replace.mkv"
+printf 'original movie\n%090d' 0 >"$REPLACE_INPUT"
+rm -f -- "$COMMAND_LOG" "$COUNTER" "$FALLBACK_LEAK"
+PATH="${FAKE_BIN}:${PATH}" SHRINKRAY_DRI_DIR="$DRI_DIR" SHRINKRAY_ALLOW_REGULAR_RENDER_DEVICES=1 \
+SHRINKRAY_TEST_LISTED=qsv SHRINKRAY_TEST_WORKING=qsv SHRINKRAY_TEST_QSV_DEVICE="${DRI_DIR}/renderD128" \
+SHRINKRAY_TEST_COMMAND_LOG="$COMMAND_LOG" SHRINKRAY_TEST_DISK_COUNTER="$COUNTER" SHRINKRAY_TEST_DISK_MODE=enough \
+  bash "${ROOT_DIR}/shrinkray" "$REPLACE_INPUT" --size 1 --encoder qsv --replace-original --machine-progress >"${TEMP_DIR}/replace-hardware.log" 2>&1
+grep -q '^encoded output$' "$REPLACE_INPUT"
+[ -z "$(find "$TEMP_DIR" -maxdepth 1 -name '.replace.mkv.shrinkray-*' -print -quit)" ] || {
+  printf 'hardware test: successful replacement retained transaction artifacts\n' >&2
+  exit 1
+}
+
+printf 'original movie\n%090d' 0 >"$REPLACE_INPUT"
+rm -f -- "$COMMAND_LOG" "$COUNTER" "$FALLBACK_LEAK"
+PATH="${FAKE_BIN}:${PATH}" SHRINKRAY_DRI_DIR="$DRI_DIR" SHRINKRAY_ALLOW_REGULAR_RENDER_DEVICES=1 \
+SHRINKRAY_TEST_LISTED=qsv SHRINKRAY_TEST_WORKING=qsv SHRINKRAY_TEST_QSV_DEVICE="${DRI_DIR}/renderD128" \
+SHRINKRAY_TEST_FAIL_HARDWARE=true SHRINKRAY_TEST_EXPECT_OUTPUT_CLEAN=true \
+SHRINKRAY_TEST_SOURCE_PATH="$REPLACE_INPUT" SHRINKRAY_TEST_FALLBACK_LEAK="$FALLBACK_LEAK" \
+SHRINKRAY_TEST_COMMAND_LOG="$COMMAND_LOG" SHRINKRAY_TEST_DISK_COUNTER="$COUNTER" SHRINKRAY_TEST_DISK_MODE=enough \
+  bash "${ROOT_DIR}/shrinkray" "$REPLACE_INPUT" --size 1 --encoder auto --replace-original --machine-progress >"${TEMP_DIR}/replace-fallback.log" 2>&1
+[ ! -e "$FALLBACK_LEAK" ] || { printf 'hardware test: source or temp changed before software fallback\n' >&2; exit 1; }
+grep -q '^encoded output$' "$REPLACE_INPUT"
+
 printf 'Hardware acceleration test passed.\n'
