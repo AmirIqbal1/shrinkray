@@ -127,6 +127,31 @@ func TestDashboardServesLogScrollHelpersBeforeApplication(t *testing.T) {
 	}
 }
 
+func TestDashboardReplacementOptionDefaultsUnchecked(t *testing.T) {
+	server, _, _ := makeTwoRootServer(t)
+	index := requestServer(t, server, http.MethodGet, "/", nil)
+	if index.Code != http.StatusOK {
+		t.Fatalf("dashboard index status = %d; want %d", index.Code, http.StatusOK)
+	}
+	html := index.Body.String()
+	if !strings.Contains(html, `id="replace-original" type="checkbox"`) || strings.Contains(html, `id="replace-original" type="checkbox" checked`) {
+		t.Fatalf("replacement option is missing or pre-checked: %s", html)
+	}
+	if !strings.Contains(html, "The source is kept until the new file has completed and passed validation.") {
+		t.Fatal("replacement safety helper text is missing")
+	}
+}
+
+func TestReplacementFieldIsAdditiveToJobAPI(t *testing.T) {
+	server, movies, _ := makeTwoRootServer(t)
+	writeTestFile(t, filepath.Join(movies, "movie.mkv"))
+	body := []byte(`{"root_id":"movies","path":"movie.mkv","preset":"balanced","container":"mkv","replace_original":true}`)
+	response := requestServer(t, server, http.MethodPost, "/api/jobs", body)
+	if response.Code != http.StatusAccepted || !strings.Contains(response.Body.String(), `"replace_original":true`) || !strings.Contains(response.Body.String(), `"output_path":"movie.mkv"`) {
+		t.Fatalf("replacement API response = %d, %s", response.Code, response.Body.String())
+	}
+}
+
 func TestClearHistoryEndpointAndDashboardControls(t *testing.T) {
 	movies, _ := makeRootDirectories(t)
 	stateDir := t.TempDir()

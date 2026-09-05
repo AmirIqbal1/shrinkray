@@ -50,6 +50,30 @@ grep -q 'Safety reserve:' "$LOG"
 }
 
 rm -f -- "$COUNTER" "$MARKER" "$LOG"
+if run_shrinkray insufficient "$INPUT" --size 1 --codec hevc --replace-original >"$LOG" 2>&1; then
+  printf 'disk space test: replacement ignored insufficient preflight\n' >&2
+  exit 1
+fi
+grep -q '^original remains untouched$' "$INPUT"
+[ -z "$(find "$TEMP_DIR" -maxdepth 1 -name '.original.mkv.shrinkray-*' -print -quit)" ] || {
+  printf 'disk space test: replacement preflight left a transaction artifact\n' >&2
+  exit 1
+}
+
+rm -f -- "$COUNTER" "$MARKER" "$LOG"
+if timeout --signal=TERM 1s env PATH="${FAKE_BIN}:${PATH}" TMPDIR="$TEST_TMP" \
+  SHRINKRAY_TEST_DISK_COUNTER="$COUNTER" SHRINKRAY_TEST_ENCODE_MARKER="$MARKER" SHRINKRAY_TEST_DISK_MODE=cancel \
+  bash "${ROOT_DIR}/shrinkray" "$INPUT" --size 1 --codec av1 --replace-original >"$LOG" 2>&1; then
+  printf 'disk space test: cancelled replacement unexpectedly succeeded\n' >&2
+  exit 1
+fi
+grep -q '^original remains untouched$' "$INPUT"
+[ -z "$(find "$TEMP_DIR" -maxdepth 1 -name '.original.mkv.shrinkray-*' -print -quit)" ] || {
+  printf 'disk space test: cancelled replacement left a transaction artifact\n' >&2
+  exit 1
+}
+
+rm -f -- "$COUNTER" "$MARKER" "$LOG"
 if run_shrinkray critical "$INPUT" --size 1 --codec av1 -y >"$LOG" 2>&1; then
   printf 'disk space test: critical low-space encode unexpectedly succeeded\n' >&2
   exit 1
@@ -59,6 +83,17 @@ grep -q '^original remains untouched$' "$INPUT"
 [ ! -e "${TEMP_DIR}/original.shrunk.mkv.part" ]
 [ -z "$(find "$TEST_TMP" -mindepth 1 -print -quit)" ] || {
   printf 'disk space test: critical abort left encoder work files\n' >&2
+  exit 1
+}
+
+rm -f -- "$COUNTER" "$MARKER" "$LOG"
+if run_shrinkray critical "$INPUT" --size 1 --codec av1 --replace-original >"$LOG" 2>&1; then
+  printf 'disk space test: critical replacement unexpectedly succeeded\n' >&2
+  exit 1
+fi
+grep -q '^original remains untouched$' "$INPUT"
+[ -z "$(find "$TEMP_DIR" -maxdepth 1 -name '.original.mkv.shrinkray-*' -print -quit)" ] || {
+  printf 'disk space test: critical replacement left a transaction artifact\n' >&2
   exit 1
 }
 
@@ -78,5 +113,22 @@ fi
 }
 grep -q 'Batch summary: 1 successful, 1 failed' "$LOG"
 grep -q 'Disk space: OK' "$LOG"
+
+rm -f -- "$COUNTER" "$MARKER" "$LOG"
+BATCH_REPLACE="${TEMP_DIR}/batch-replace"
+mkdir -p -- "$BATCH_REPLACE"
+printf 'first original\n%090d' 0 >"${BATCH_REPLACE}/one.mkv"
+printf 'second original\n%090d' 0 >"${BATCH_REPLACE}/two.mkv"
+if run_shrinkray batch --batch "$BATCH_REPLACE" --size 1 --codec hevc --replace-original >"$LOG" 2>&1; then
+  printf 'disk space test: partially failed replacement batch unexpectedly returned success\n' >&2
+  exit 1
+fi
+grep -q '^first original' "${BATCH_REPLACE}/one.mkv"
+grep -q '^temporary encoded output$' "${BATCH_REPLACE}/two.mkv"
+grep -q 'Batch summary: 1 safely replaced, 1 replacement failed' "$LOG"
+[ -z "$(find "$BATCH_REPLACE" -maxdepth 1 -name '.*.shrinkray-*' -print -quit)" ] || {
+  printf 'disk space test: batch replacement retained a transaction artifact\n' >&2
+  exit 1
+}
 
 printf 'Disk-space safety test passed.\n'

@@ -482,6 +482,85 @@ func TestRequestedAndActualEncoderPersistAndLegacyDefaultsSafely(t *testing.T) {
 	}
 }
 
+func TestLegacyJobDefaultsReplacementOff(t *testing.T) {
+	mediaDir, stateDir := t.TempDir(), t.TempDir()
+	finished := time.Now().UTC()
+	legacy := []byte(`{"version":1,"next_id":2,"jobs":[{"id":"1","state":"completed","stage":"Completed","queued_at":"` + finished.Format(time.RFC3339Nano) + `","settings":{"preset":"balanced","quality":"good","container":"mkv","target_mb":1},"logs":[]}]}`)
+	if err := os.WriteFile(filepath.Join(stateDir, "jobs.json"), legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := persistentManagerFixture(t, mediaDir, stateDir, newControlledRunner())
+	defer manager.Close()
+	job := findJob(t, manager, "1")
+	if job.Settings.ReplaceOriginal || job.SourceReplaced || job.OriginalKept {
+		t.Fatalf("legacy job enabled replacement fields: %#v", job)
+	}
+}
+
+func TestInterruptedSameContainerReplacementCleansOnlyProvenArtifacts(t *testing.T) {
+	mediaDir, stateDir := t.TempDir(), t.TempDir()
+	source := filepath.Join(mediaDir, "movie.mkv")
+	writeTestFile(t, source)
+	transactionID := "7-recoverytest"
+	backup := filepath.Join(mediaDir, ".movie.mkv.shrinkray-backup-"+transactionID)
+	temporary := filepath.Join(mediaDir, ".movie.mkv.shrinkray-replace-"+transactionID+".part.mkv")
+	if err := os.Link(source, backup); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(temporary, []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unrelated := filepath.Join(mediaDir, ".movie.mkv.shrinkray-backup-unrelated")
+	if err := os.WriteFile(unrelated, []byte("unrelated"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	job := &Job{ID: "7", RootID: "movies", RootLabel: "Movies", Path: "movie.mkv", Filename: "movie.mkv", OutputPath: "movie.mkv", OriginalSize: 5, Settings: JobSettings{Container: "mkv", TargetMB: 1, ReplaceOriginal: true}, State: StateRunning, Stage: stageValidation, QueuedAt: time.Now().UTC(), Logs: []string{}, TransactionID: transactionID, OriginalKept: true}
+	store := newJobStateStore(stateDir)
+	if err := store.Save(jobStateSnapshot{revision: 1, state: persistedJobState{Version: jobStateVersion, NextID: 8, Jobs: []*Job{job}}}); err != nil {
+		t.Fatal(err)
+	}
+	manager := persistentManagerFixture(t, mediaDir, stateDir, newControlledRunner())
+	defer manager.Close()
+	for _, removed := range []string{backup, temporary} {
+		if _, err := os.Lstat(removed); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("proven redundant artifact remained: %s: %v", removed, err)
+		}
+	}
+	if contents, err := os.ReadFile(unrelated); err != nil || string(contents) != "unrelated" {
+		t.Fatalf("unrelated backup changed: %q, %v", contents, err)
+	}
+	restored := findJob(t, manager, "7")
+	if !restored.OriginalKept || !strings.Contains(strings.Join(restored.Logs, "\n"), "original remained in place") {
+		t.Fatalf("replacement recovery result = %#v", restored)
+	}
+}
+
+func TestInterruptedReplacementRetainsAmbiguousBackup(t *testing.T) {
+	mediaDir, stateDir := t.TempDir(), t.TempDir()
+	source := filepath.Join(mediaDir, "movie.mkv")
+	if err := os.WriteFile(source, []byte("new encode"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	transactionID := "8-ambiguous"
+	backup := filepath.Join(mediaDir, ".movie.mkv.shrinkray-backup-"+transactionID)
+	if err := os.WriteFile(backup, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	job := &Job{ID: "8", RootID: "movies", RootLabel: "Movies", Path: "movie.mkv", Filename: "movie.mkv", OutputPath: "movie.mkv", Settings: JobSettings{Container: "mkv", TargetMB: 1, ReplaceOriginal: true}, State: StateRunning, QueuedAt: time.Now().UTC(), Logs: []string{}, TransactionID: transactionID}
+	store := newJobStateStore(stateDir)
+	if err := store.Save(jobStateSnapshot{revision: 1, state: persistedJobState{Version: jobStateVersion, NextID: 9, Jobs: []*Job{job}}}); err != nil {
+		t.Fatal(err)
+	}
+	manager := persistentManagerFixture(t, mediaDir, stateDir, newControlledRunner())
+	defer manager.Close()
+	if contents, err := os.ReadFile(backup); err != nil || string(contents) != "original" {
+		t.Fatalf("ambiguous backup was not retained: %q, %v", contents, err)
+	}
+	if logs := strings.Join(findJob(t, manager, "8").Logs, "\n"); !strings.Contains(logs, backup) || !strings.Contains(logs, "recovery attention required") {
+		t.Fatalf("recovery log did not identify retained backup: %s", logs)
+	}
+}
+
 func TestProgressPersistenceIsThrottled(t *testing.T) {
 	mediaDir, stateDir := t.TempDir(), t.TempDir()
 	manager := persistentManagerFixture(t, mediaDir, stateDir, burstProgressRunner{})

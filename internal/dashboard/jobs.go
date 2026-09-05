@@ -3,6 +3,8 @@ package dashboard
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -34,6 +36,7 @@ type JobSettings struct {
 	KeepAllAudio     bool   `json:"keep_all_audio"`
 	TargetMB         int64  `json:"target_mb"`
 	RequestedEncoder string `json:"requested_encoder,omitempty"`
+	ReplaceOriginal  bool   `json:"replace_original"`
 }
 
 type Job struct {
@@ -67,14 +70,21 @@ type Job struct {
 	SavedPercent         float64     `json:"saved_percent,omitempty"`
 	Failure              string      `json:"failure,omitempty"`
 	ActualEncoder        string      `json:"actual_encoder,omitempty"`
+	SourceReplaced       bool        `json:"source_replaced"`
+	OriginalKept         bool        `json:"original_kept,omitempty"`
+	FinalPath            string      `json:"final_path,omitempty"`
+	TransactionID        string      `json:"transaction_id,omitempty"`
 
 	cancel              context.CancelFunc
 	outputAbs           string
 	lastProgressPersist time.Time
+	reservationKeys     []string
 }
 
 type RunResult struct {
-	Size int64
+	Size           int64
+	SourceReplaced bool
+	FinalPath      string
 }
 
 type JobRunner interface {
@@ -106,14 +116,16 @@ func (r *CLIRunner) Run(ctx context.Context, job *Job, stage func(string), progr
 	if err != nil {
 		return RunResult{}, errors.New("source movie is no longer available")
 	}
-	output := outputPath(source, job.Settings.Container)
+	output := intendedOutputPath(source, job.Settings.Container, job.Settings.ReplaceOriginal)
 	if job.outputAbs != "" && output != job.outputAbs {
 		return RunResult{}, errors.New("intended output path changed")
 	}
-	if _, err := os.Lstat(output); err == nil {
-		return RunResult{}, errors.New("intended output already exists")
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return RunResult{}, errors.New("could not inspect intended output")
+	if output != source {
+		if _, err := os.Lstat(output); err == nil {
+			return RunResult{}, errors.New("intended output already exists")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return RunResult{}, errors.New("could not inspect intended output")
+		}
 	}
 	targetBytes := TargetBytesFromMB(job.Settings.TargetMB)
 	checkDisk := func() (DiskSpaceStatus, error) {
@@ -148,6 +160,9 @@ func (r *CLIRunner) Run(ctx context.Context, job *Job, stage func(string), progr
 	args := []string{source, "--size", strconv.FormatInt(job.Settings.TargetMB, 10), "--quality", job.Settings.Quality, "--container", job.Settings.Container, "--encoder", requestedEncoder, "--machine-progress"}
 	if job.Settings.KeepAllAudio {
 		args = append(args, "--keep-all-audio")
+	}
+	if job.Settings.ReplaceOriginal {
+		args = append(args, "--replace-original", "--transaction-id", job.TransactionID)
 	}
 	cmd := exec.Command(r.shrinkrayBin, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -193,6 +208,7 @@ func (r *CLIRunner) Run(ctx context.Context, job *Job, stage func(string), progr
 	currentStage := "Inspecting"
 	criticalDisk := false
 	diskCheckWarningLogged := false
+	lastWarning := ""
 	for scanner.Scan() {
 		line := r.roots.Redact(scanner.Text())
 		if record, complete, machineLine := progressParser.Consume(line); machineLine {
@@ -217,6 +233,9 @@ func (r *CLIRunner) Run(ctx context.Context, job *Job, stage func(string), progr
 			continue
 		}
 		logLine(line)
+		if strings.HasPrefix(strings.TrimSpace(line), "!!") {
+			lastWarning = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "!!"))
+		}
 		if parsed := stageFromLog(line); parsed != "" {
 			currentStage = parsed
 			stage(parsed)
@@ -227,7 +246,7 @@ func (r *CLIRunner) Run(ctx context.Context, job *Job, stage func(string), progr
 	}
 	waitErr := cmd.Wait()
 	close(done)
-	if ctx.Err() != nil {
+	if ctx.Err() != nil && (waitErr != nil || !job.Settings.ReplaceOriginal) {
 		return RunResult{}, context.Canceled
 	}
 	if scanner.Err() != nil {
@@ -240,13 +259,16 @@ func (r *CLIRunner) Run(ctx context.Context, job *Job, stage func(string), progr
 		if currentStage == stageCriticalDisk {
 			return RunResult{}, criticalDiskError()
 		}
+		if lastWarning != "" {
+			return RunResult{}, errors.New(lastWarning)
+		}
 		return RunResult{}, errors.New("shrinkray exited unsuccessfully")
 	}
 	info, err := os.Stat(output)
 	if err != nil || !info.Mode().IsRegular() {
 		return RunResult{}, errors.New("shrinkray did not create the expected output")
 	}
-	return RunResult{Size: info.Size()}, nil
+	return RunResult{Size: info.Size(), SourceReplaced: job.Settings.ReplaceOriginal, FinalPath: job.OutputPath}, nil
 }
 
 func insufficientDiskError(status DiskSpaceStatus) error {
@@ -286,7 +308,7 @@ func stageFromLog(line string) string {
 		return stageHardwareVAAPI
 	case strings.Contains(lower, "hevc hardware") && strings.Contains(lower, "nvidia nvenc"):
 		return stageHardwareNVENC
-	case strings.Contains(lower, "validating output"):
+	case strings.Contains(lower, "validating output"), strings.Contains(lower, "validating replacement output"):
 		return stageValidation
 	case strings.Contains(lower, "insufficient disk space"), strings.Contains(lower, "not enough free disk space"):
 		return stageInsufficientDisk
@@ -374,6 +396,17 @@ func (m *JobManager) Submit(rootID, path, preset, container string, keepAllAudio
 	if len(requestedEncoders) > 0 && requestedEncoders[0] != "" {
 		requestedEncoder = requestedEncoders[0]
 	}
+	return m.submit(rootID, path, preset, container, keepAllAudio, exactMB, false, requestedEncoder)
+}
+
+func (m *JobManager) SubmitWithReplace(rootID, path, preset, container string, keepAllAudio bool, exactMB int64, replaceOriginal bool, requestedEncoder string) (*Job, error) {
+	if requestedEncoder == "" {
+		requestedEncoder = "auto"
+	}
+	return m.submit(rootID, path, preset, container, keepAllAudio, exactMB, replaceOriginal, requestedEncoder)
+}
+
+func (m *JobManager) submit(rootID, path, preset, container string, keepAllAudio bool, exactMB int64, replaceOriginal bool, requestedEncoder string) (*Job, error) {
 	if !validRequestedEncoder(requestedEncoder) {
 		return nil, errors.New("encoder must be auto, software, qsv, vaapi, or nvenc")
 	}
@@ -396,11 +429,13 @@ func (m *JobManager) Submit(rootID, path, preset, container string, keepAllAudio
 	if err != nil {
 		return nil, err
 	}
-	output := outputPath(source, container)
-	if _, err := os.Lstat(output); err == nil {
-		return nil, errors.New("intended output already exists")
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, errors.New("could not inspect intended output")
+	output := intendedOutputPath(source, container, replaceOriginal)
+	if output != source {
+		if _, err := os.Lstat(output); err == nil {
+			return nil, errors.New("intended output already exists")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, errors.New("could not inspect intended output")
+		}
 	}
 	relOutput, err := filepathRelSlash(mediaRoot.Root.Path(), output)
 	if err != nil {
@@ -416,16 +451,19 @@ func (m *JobManager) Submit(rootID, path, preset, container string, keepAllAudio
 		m.mu.Unlock()
 		return nil, errors.New("job queue is shutting down")
 	}
-	if m.reserved[output] {
+	reservationKeys := replacementReservationKeys(source, output, replaceOriginal)
+	if reservedPath(m.reserved, reservationKeys) {
 		m.mu.Unlock()
 		return nil, errors.New("a job already targets that output")
 	}
-	if _, err := os.Lstat(output); err == nil {
-		m.mu.Unlock()
-		return nil, errors.New("intended output already exists")
-	} else if !errors.Is(err, os.ErrNotExist) {
-		m.mu.Unlock()
-		return nil, errors.New("could not inspect intended output")
+	if output != source {
+		if _, err := os.Lstat(output); err == nil {
+			m.mu.Unlock()
+			return nil, errors.New("intended output already exists")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			m.mu.Unlock()
+			return nil, errors.New("could not inspect intended output")
+		}
 	}
 	if m.nextID == math.MaxUint64 {
 		m.mu.Unlock()
@@ -435,18 +473,22 @@ func (m *JobManager) Submit(rootID, path, preset, container string, keepAllAudio
 	job := &Job{
 		ID: strconv.FormatUint(m.nextID, 10), RootID: mediaRoot.ID, RootLabel: mediaRoot.Label,
 		Path: clean, Filename: filepathBase(clean), OutputPath: relOutput,
-		OriginalSize: info.Size(), Settings: JobSettings{Preset: preset, Quality: quality, Container: container, KeepAllAudio: keepAllAudio, TargetMB: target, RequestedEncoder: requestedEncoder},
+		OriginalSize: info.Size(), Settings: JobSettings{Preset: preset, Quality: quality, Container: container, KeepAllAudio: keepAllAudio, TargetMB: target, RequestedEncoder: requestedEncoder, ReplaceOriginal: replaceOriginal},
 		State: StateQueued, Stage: "Waiting", QueuedAt: time.Now().UTC(), Logs: []string{}, outputAbs: output,
+		OriginalKept: replaceOriginal, FinalPath: relOutput, reservationKeys: reservationKeys,
 		DiskAvailableBytes: initialDisk.AvailableBytes, DiskRequiredBytes: initialDisk.RequiredBytes,
 		DiskSafetyReserve: initialDisk.ReserveBytes, DiskSpaceWarning: initialDisk.Warning,
 	}
+	if replaceOriginal {
+		job.TransactionID = newTransactionID(job.ID)
+	}
 	m.jobs = append(m.jobs, job)
-	m.reserved[output] = true
+	reservePaths(m.reserved, reservationKeys)
 	m.markPersistenceDirtyLocked()
 	if m.store != nil {
 		if err := m.store.Save(m.persistenceSnapshotLocked()); err != nil {
 			m.jobs = m.jobs[:len(m.jobs)-1]
-			delete(m.reserved, output)
+			releasePaths(m.reserved, reservationKeys)
 			m.mu.Unlock()
 			log.Printf("ERROR: could not persist submitted job: %v", err)
 			return nil, fmt.Errorf("could not persist the submitted job: %w", ErrJobPersistence)
@@ -457,6 +499,63 @@ func (m *JobManager) Submit(rootID, path, preset, container string, keepAllAudio
 	result := cloneJob(job, time.Now())
 	m.mu.Unlock()
 	return result, nil
+}
+
+func intendedOutputPath(source, container string, replaceOriginal bool) string {
+	if replaceOriginal {
+		return replacementOutputPath(source, container)
+	}
+	return outputPath(source, container)
+}
+
+func replacementReservationKeys(source, output string, replaceOriginal bool) []string {
+	keys := []string{output}
+	if replaceOriginal && source != output {
+		keys = append(keys, source)
+	}
+	return keys
+}
+
+func reservedPath(reserved map[string]bool, keys []string) bool {
+	for _, key := range keys {
+		if reserved[key] {
+			return true
+		}
+	}
+	return false
+}
+
+func reservePaths(reserved map[string]bool, keys []string) {
+	for _, key := range keys {
+		reserved[key] = true
+	}
+}
+
+func releasePaths(reserved map[string]bool, keys []string) {
+	for _, key := range keys {
+		delete(reserved, key)
+	}
+}
+
+func newTransactionID(jobID string) string {
+	random := make([]byte, 12)
+	if _, err := rand.Read(random); err == nil {
+		return jobID + "-" + hex.EncodeToString(random)
+	}
+	return fmt.Sprintf("%s-%d", jobID, time.Now().UnixNano())
+}
+
+func validTransactionID(value string) bool {
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	for _, character := range value {
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || character == '.' || character == '_' || character == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func filepathRelSlash(base, target string) (string, error) {
@@ -493,7 +592,7 @@ func (m *JobManager) Cancel(id string) error {
 		case StateQueued:
 			now := time.Now().UTC()
 			job.State, job.Stage, job.FinishedAt = StateCancelled, "Cancelled", &now
-			delete(m.reserved, job.outputAbs)
+			releasePaths(m.reserved, job.reservationKeys)
 			m.removePendingLocked(job)
 			pruneTerminalHistory(&m.jobs)
 			m.markPersistenceDirtyLocked()
@@ -594,7 +693,7 @@ func (m *JobManager) worker() {
 				m.mu.Lock()
 				finished := time.Now().UTC()
 				job.State, job.Stage, job.Failure, job.FinishedAt, job.cancel = StateFailed, "Persistence error", "Shrinkray could not safely record that this job started, so the encode was not launched.", &finished, nil
-				delete(m.reserved, job.outputAbs)
+				releasePaths(m.reserved, job.reservationKeys)
 				pruneTerminalHistory(&m.jobs)
 				m.markPersistenceDirtyLocked()
 				m.mu.Unlock()
@@ -694,7 +793,8 @@ func (m *JobManager) worker() {
 		}
 		finished := time.Now().UTC()
 		job.FinishedAt, job.cancel = &finished, nil
-		if errors.Is(err, context.Canceled) || wasCancelled {
+		completedReplacement := err == nil && result.SourceReplaced
+		if (errors.Is(err, context.Canceled) || wasCancelled) && !completedReplacement {
 			job.State, job.Stage = StateCancelled, "Cancelled"
 		} else if err != nil {
 			job.State, job.Failure = StateFailed, err.Error()
@@ -708,6 +808,11 @@ func (m *JobManager) worker() {
 			}
 		} else {
 			job.State, job.Stage, job.ResultSize = StateCompleted, "Completed", result.Size
+			job.SourceReplaced = result.SourceReplaced
+			job.OriginalKept = job.Settings.ReplaceOriginal && !result.SourceReplaced
+			if result.FinalPath != "" {
+				job.FinalPath = result.FinalPath
+			}
 			job.ProgressPercent, job.StageProgressPercent = 100, 100
 			job.ProcessedSeconds = job.DurationSeconds
 			job.ETASeconds, job.ETAIsEstimate = nil, false
@@ -715,7 +820,10 @@ func (m *JobManager) worker() {
 				job.SavedPercent = (1 - float64(result.Size)/float64(job.OriginalSize)) * 100
 			}
 		}
-		delete(m.reserved, job.outputAbs)
+		releasePaths(m.reserved, job.reservationKeys)
+		if !job.Settings.ReplaceOriginal || job.SourceReplaced {
+			job.TransactionID = ""
+		}
 		pruneTerminalHistory(&m.jobs)
 		m.markPersistenceDirtyLocked()
 		m.mu.Unlock()
@@ -766,6 +874,7 @@ func actualEncoderFromStage(stage string) string {
 func cloneJob(job *Job, now time.Time) *Job {
 	copy := *job
 	copy.cancel = nil
+	copy.reservationKeys = nil
 	if job.ETASeconds != nil {
 		eta := *job.ETASeconds
 		copy.ETASeconds = &eta
@@ -813,5 +922,9 @@ func (s JobSettings) String() string {
 	if encoder == "" {
 		encoder = "software"
 	}
-	return fmt.Sprintf("%s, %s, %s, %s, encoder %s", s.Preset, s.Quality, strings.ToUpper(s.Container), audio, encoder)
+	mode := "separate output"
+	if s.ReplaceOriginal {
+		mode = "replace original"
+	}
+	return fmt.Sprintf("%s, %s, %s, %s, encoder %s, %s", s.Preset, s.Quality, strings.ToUpper(s.Container), audio, encoder, mode)
 }

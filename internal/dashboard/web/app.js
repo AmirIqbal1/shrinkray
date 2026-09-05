@@ -243,6 +243,7 @@ async function submitJob(event) {
     preset,
     container: $('#container').value,
     keep_all_audio: $('#audio').value === 'all',
+    replace_original: $('#replace-original').checked,
     requested_encoder: $('#encoder').value,
     exact_mb: preset === 'exact' ? exact : 0,
   };
@@ -261,7 +262,8 @@ function jobSettings(job) {
   const preset = labels[job.settings.preset] || 'Custom';
   const container = String(job.settings.container || 'mkv').toUpperCase();
   const requested = encoderDisplayName(job.settings.requested_encoder || 'software');
-  return `${preset} · ${job.settings.quality || 'good'} · ${container} · ${job.settings.keep_all_audio ? 'all audio' : 'first audio'} · requested ${requested}`;
+  const outputMode = job.settings.replace_original ? 'replace original' : 'separate output';
+  return `${preset} · ${job.settings.quality || 'good'} · ${container} · ${job.settings.keep_all_audio ? 'all audio' : 'first audio'} · requested ${requested} · ${outputMode}`;
 }
 
 function encoderDisplayName(encoder) {
@@ -296,9 +298,13 @@ function normalizeJob(job) {
     disk_required_bytes: numberOrZero(job.disk_required_bytes),
     disk_safety_reserve_bytes: numberOrZero(job.disk_safety_reserve_bytes),
     disk_space_warning: job.disk_space_warning === true,
+    original_size: numberOrZero(job.original_size),
     result_size: numberOrZero(job.result_size),
     saved_percent: numberOrZero(job.saved_percent),
     actual_encoder: typeof job.actual_encoder === 'string' ? job.actual_encoder : '',
+    source_replaced: job.source_replaced === true,
+    original_kept: job.original_kept === true,
+    final_path: typeof job.final_path === 'string' ? job.final_path : '',
     logs: Array.isArray(job.logs) ? job.logs : [],
     settings: {
       preset: typeof settings.preset === 'string' ? settings.preset : 'balanced',
@@ -307,6 +313,7 @@ function normalizeJob(job) {
       keep_all_audio: settings.keep_all_audio === true,
       target_mb: numberOrZero(settings.target_mb),
       requested_encoder: typeof settings.requested_encoder === 'string' ? settings.requested_encoder : 'software',
+      replace_original: settings.replace_original === true,
     },
   };
 }
@@ -357,10 +364,15 @@ function renderJob(job) {
         ${active && job.eta_seconds !== null && job.eta_seconds > 0 ? `<span><small>${job.eta_is_estimate ? 'Estimated ETA' : 'ETA'}</small><strong>${formatDuration(job.eta_seconds)}</strong></span>` : ''}
       </div>
     </div>` : '';
+  const resultTitle = job.source_replaced ? 'Original replaced safely' : '100% · Completed';
+  const resultSizes = job.source_replaced
+    ? `${formatBytes(job.original_size)} → ${formatBytes(job.result_size)} · Saved ${job.saved_percent.toFixed(1)}%`
+    : `${formatBytes(job.result_size)} · ${job.saved_percent >= 0 ? `${job.saved_percent.toFixed(1)}% saved` : 'output is larger'}`;
   const result = job.state === 'completed'
-    ? `<div class="result"><strong>100% · Completed</strong><span>${formatBytes(job.result_size)} · ${job.saved_percent >= 0 ? `${job.saved_percent.toFixed(1)}% saved` : 'output is larger'}</span></div>`
+    ? `<div class="result"><strong>${resultTitle}</strong><span>${resultSizes}</span>${job.final_path ? `<small>${escapeHTML(job.final_path)}</small>` : ''}</div>`
     : '';
-  const failure = job.failure ? `<p class="failure">${escapeHTML(job.failure)}</p>` : '';
+  const originalKept = job.settings.replace_original && job.original_kept ? '<p class="failure"><strong>Original kept</strong></p>' : '';
+  const failure = `${originalKept}${job.failure ? `<p class="failure">${escapeHTML(job.failure)}</p>` : ''}`;
   const actualEncoder = job.actual_encoder ? `<p class="encoder-used">Encoder: <strong>${escapeHTML(encoderDisplayName(job.actual_encoder))}</strong></p>` : '';
   const logLines = Array.isArray(job.logs) ? job.logs : [];
   const hasStoredLogState = state.knownLogJobs.has(job.id);
@@ -460,10 +472,15 @@ async function clearHistory() {
 
 async function loadJobs() {
   try {
+    const previouslyReplaced = new Set(state.jobs.filter((job) => job.source_replaced).map((job) => job.id));
     const data = await api('/api/jobs');
     const jobs = Array.isArray(data?.jobs) ? data.jobs : [];
     state.jobs = jobs.map(normalizeJob).filter((job) => job !== null);
     renderJobs();
+    if (state.jobs.some((job) => job.source_replaced && !previouslyReplaced.has(job.id))) {
+      await loadFiles(state.currentPath);
+      clearMovieSelection();
+    }
   } catch (error) {
     showNotice(error.message);
   }

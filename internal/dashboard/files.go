@@ -233,3 +233,8 @@ func outputPath(source, container string) string {
 	ext := filepath.Ext(source)
 	return strings.TrimSuffix(source, ext) + ".shrunk." + container
 }
+
+func replacementOutputPath(source, container string) string {
+	ext := filepath.Ext(source)
+	return strings.TrimSuffix(source, ext) + "." + container
+}

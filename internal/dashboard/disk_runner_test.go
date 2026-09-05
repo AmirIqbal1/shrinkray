@@ -131,6 +131,42 @@ cp -- "$input" "${input%.*}.shrunk.mkv"
 	}
 }
 
+func TestDashboardRunnerPassesSafeReplacementSettings(t *testing.T) {
+	script := `#!/usr/bin/env bash
+set -euo pipefail
+input="$1"
+shift
+replace=false
+transaction=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --replace-original) replace=true; shift ;;
+    --transaction-id) transaction="$2"; shift 2 ;;
+    --size|--quality|--container|--encoder) shift 2 ;;
+    --machine-progress) shift ;;
+    *) shift ;;
+  esac
+done
+[ "$replace" = true ] && [ "$transaction" = "9-test-token" ] || exit 64
+printf 'new' >"${input}.validated"
+mv -f -- "${input}.validated" "$input"
+`
+	checker := &sequenceDiskChecker{statuses: []DiskSpaceStatus{sufficientTestDisk()}}
+	runner, job, source, _ := runnerDiskFixture(t, script, checker)
+	job.Settings.ReplaceOriginal = true
+	job.TransactionID = "9-test-token"
+	job.OutputPath = "movie.mkv"
+	job.FinalPath = "movie.mkv"
+	job.outputAbs = source
+	result, err := runTestCLI(runner, job, func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.SourceReplaced || result.FinalPath != "movie.mkv" || result.Size != 3 {
+		t.Fatalf("replacement result = %#v", result)
+	}
+}
+
 func TestCriticalDiskSpaceStopsEncodeAndKeepsOriginal(t *testing.T) {
 	script := `#!/usr/bin/env bash
 set -u

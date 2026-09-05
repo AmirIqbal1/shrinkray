@@ -29,7 +29,8 @@ The lightweight server dashboard lets another device browse movies that are
 already on a headless server, inspect them, and queue Shrinkray jobs. It uses a
 single encoding worker so simultaneous software encodes cannot overload a small
 server. Running jobs report live pass progress, encoding speed, and ETA. The
-dashboard does not upload, rename, replace, move, or delete files.
+dashboard does not upload files. Its optional replacement setting is disabled
+by default and uses the same validated safe-replacement transaction as the CLI.
 
 Go 1.22 or newer is required to build and run the server. From a repository
 clone, test it locally with:
@@ -351,6 +352,7 @@ HEVC mode unless you specifically need AV1.
 | `--container <mkv\|mp4>` | Select the output container | `mkv` |
 | `--keep-all-audio` | Keep all audio tracks instead of the first one | off |
 | `--output <path>` | Set a custom output for one input file | automatic |
+| `--replace-original` | Replace the source only after a smaller output passes validation | off |
 | `--batch <dir>` | Process videos in a directory | — |
 | `--recursive` | Include subdirectories with `--batch` | off |
 | `--dry-run` | Show planned work without encoding | off |
@@ -361,9 +363,46 @@ Run `shrinkray --help` for usage examples.
 
 ## Safety
 
-Shrinkray never deletes or replaces the source movie. It encodes to a temporary
-file ending in `.part`, validates that file with `ffprobe`, and only then moves
-it to the requested output name. Failed and interrupted encodes are cleaned up.
+By default, Shrinkray never deletes or replaces the source movie. It encodes to
+a temporary file ending in `.part`, validates that file with `ffprobe`, and only
+then moves it to the requested `.shrunk.*` output name. Failed and interrupted
+encodes are cleaned up.
+
+### Safe replace original
+
+Safe replacement is optional and disabled by default. Enable it with
+`--replace-original` or the unchecked **Replace original after successful
+shrink** dashboard option:
+
+```bash
+shrinkray movie.mkv --size 1200 --replace-original
+```
+
+Shrinkray encodes a separate sibling temporary movie on the destination
+filesystem while leaving the source untouched. Before replacement, it verifies
+that the output is a non-empty regular file, `ffprobe` can read its video stream
+and duration, its duration matches the source within the larger of two seconds
+or 0.5%, and it is smaller than the source. Encoding, hardware fallback, disk
+monitoring, validation failures, and cancellation before the final transaction
+all keep the original.
+
+For same-container replacement such as `movie.mkv` to `movie.mkv`, Shrinkray
+creates and verifies a unique hard-link backup of the original, atomically
+renames the validated encode over the source path, validates the final path,
+and only then removes the backup. If the transaction fails, it restores the
+original. If rollback cannot complete, it retains the recoverable backup and
+logs its exact path for manual attention. Shrinkray aborts replacement when a
+hard-link backup cannot be created; it does not copy a multi-gigabyte source or
+fall back to a weaker destructive operation.
+
+When changing containers, the filename changes to match: `movie.mp4` becomes
+`movie.mkv`, and `movie.mkv` becomes `movie.mp4`. An existing target is never
+overwritten. Shrinkray places and validates the new target before removing the
+old source; if removing the old source fails, both valid files remain. Restart
+recovery inspects only the exact artifacts recorded for the interrupted job and
+leaves ambiguous backups in place.
+
+Users who prefer maximum safety can keep the default `.shrunk.*` behavior.
 
 ### Disk space safety
 

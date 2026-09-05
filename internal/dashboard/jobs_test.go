@@ -23,6 +23,12 @@ type controlledRunner struct {
 	emitProgress bool
 }
 
+type replacementResultRunner struct{}
+
+func (replacementResultRunner) Run(context.Context, *Job, func(string), func(ProgressUpdate), func(DiskSpaceUpdate), func(string)) (RunResult, error) {
+	return RunResult{Size: 40, SourceReplaced: true, FinalPath: "movie.mkv"}, nil
+}
+
 func newControlledRunner() *controlledRunner {
 	return &controlledRunner{started: make(chan string, 10), release: make(chan struct{}, 10)}
 }
@@ -284,6 +290,76 @@ func TestRejectExistingOutput(t *testing.T) {
 	writeTestFile(t, filepath.Join(dir, "movie.shrunk.mkv"))
 	if _, err := manager.Submit("movies", "movie.mkv", "balanced", "mkv", false, 0); err == nil {
 		t.Fatal("Submit accepted a job whose output exists")
+	}
+}
+
+func TestReplacementDefaultsOffAndKeepsShrunkOutput(t *testing.T) {
+	manager, runner, dir := managerFixture(t)
+	writeTestFile(t, filepath.Join(dir, "movie.mkv"))
+	job, err := manager.Submit("movies", "movie.mkv", "balanced", "mkv", false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Settings.ReplaceOriginal || job.OutputPath != "movie.shrunk.mkv" || job.SourceReplaced {
+		t.Fatalf("default job unexpectedly enabled replacement: %#v", job)
+	}
+	<-runner.started
+}
+
+func TestSameContainerReplacementReservesSource(t *testing.T) {
+	manager, runner, dir := managerFixture(t)
+	writeTestFile(t, filepath.Join(dir, "movie.mkv"))
+	job, err := manager.SubmitWithReplace("movies", "movie.mkv", "balanced", "mkv", false, 0, true, "software")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !job.Settings.ReplaceOriginal || job.OutputPath != "movie.mkv" || !job.OriginalKept || job.TransactionID == "" {
+		t.Fatalf("replacement job fields = %#v", job)
+	}
+	<-runner.started
+	if _, err := manager.SubmitWithReplace("movies", "movie.mkv", "balanced", "mkv", false, 0, true, "software"); err == nil {
+		t.Fatal("second job reserved the same replacement source")
+	}
+}
+
+func TestDifferentContainerReplacementUsesNewExtensionAndRefusesExistingTarget(t *testing.T) {
+	manager, runner, dir := managerFixture(t)
+	writeTestFile(t, filepath.Join(dir, "movie.mp4"))
+	job, err := manager.SubmitWithReplace("movies", "movie.mp4", "balanced", "mkv", false, 0, true, "software")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.OutputPath != "movie.mkv" || job.FinalPath != "movie.mkv" {
+		t.Fatalf("different-container target = %#v", job)
+	}
+	<-runner.started
+
+	manager2, _, dir2 := managerFixture(t)
+	writeTestFile(t, filepath.Join(dir2, "movie.mp4"))
+	writeTestFile(t, filepath.Join(dir2, "movie.mkv"))
+	if _, err := manager2.SubmitWithReplace("movies", "movie.mp4", "balanced", "mkv", false, 0, true, "software"); err == nil {
+		t.Fatal("replacement accepted an existing different-container target")
+	}
+}
+
+func TestCompletedReplacementRecordsFinalResult(t *testing.T) {
+	dir := t.TempDir()
+	roots, err := NewRootRegistry([]string{"Movies=" + dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewJobManager(roots, replacementResultRunner{})
+	t.Cleanup(manager.Close)
+	if err := os.WriteFile(filepath.Join(dir, "movie.mkv"), make([]byte, 100), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	job, err := manager.SubmitWithReplace("movies", "movie.mkv", "balanced", "mkv", false, 0, true, "software")
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed := waitForState(t, manager, job.ID, StateCompleted)
+	if !completed.SourceReplaced || completed.OriginalKept || completed.FinalPath != "movie.mkv" || completed.SavedPercent != 60 || completed.TransactionID != "" {
+		t.Fatalf("completed replacement history = %#v", completed)
 	}
 }
 
