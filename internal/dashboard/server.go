@@ -38,6 +38,21 @@ type createJobRequest struct {
 	ReplaceOriginal  bool   `json:"replace_original"`
 }
 
+type createBatchRequest struct {
+	RootID           string   `json:"root_id"`
+	Paths            []string `json:"paths"`
+	Preset           string   `json:"preset"`
+	Container        string   `json:"container"`
+	KeepAllAudio     bool     `json:"keep_all_audio"`
+	ExactMB          int64    `json:"exact_mb"`
+	RequestedEncoder string   `json:"requested_encoder"`
+	ReplaceOriginal  bool     `json:"replace_original"`
+}
+
+type cancelBatchRequest struct {
+	CancelRunning bool `json:"cancel_running"`
+}
+
 func NewServer(roots *RootRegistry, shrinkrayBin, stateDir, version string) (*Server, error) {
 	if roots == nil || len(roots.Roots()) == 0 {
 		return nil, errors.New("at least one media root is required")
@@ -66,9 +81,11 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/capabilities", s.encoderCapabilities)
 	mux.HandleFunc("/api/files", s.files)
 	mux.HandleFunc("/api/probe", s.probe)
+	mux.HandleFunc("/api/jobs/batch", s.batchJobs)
 	mux.HandleFunc("/api/jobs", s.jobsEndpoint)
 	mux.HandleFunc("/api/jobs/history", s.jobHistory)
 	mux.HandleFunc("/api/jobs/", s.jobAction)
+	mux.HandleFunc("/api/batches/", s.batchAction)
 
 	webRoot, err := fs.Sub(webAssets, "web")
 	if err != nil {
@@ -80,7 +97,7 @@ func (s *Server) routes() http.Handler {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		if r.URL.Path != "/" && r.URL.Path != "/app.js" && r.URL.Path != "/log-scroll.js" && r.URL.Path != "/encoder-options.js" && r.URL.Path != "/styles.css" {
+		if r.URL.Path != "/" && r.URL.Path != "/app.js" && r.URL.Path != "/batch-ui.js" && r.URL.Path != "/log-scroll.js" && r.URL.Path != "/encoder-options.js" && r.URL.Path != "/styles.css" {
 			http.NotFound(w, r)
 			return
 		}
@@ -176,19 +193,45 @@ func (s *Server) jobsEndpoint(w http.ResponseWriter, r *http.Request) {
 		}
 		job, err := s.jobs.SubmitWithReplace(request.RootID, request.Path, request.Preset, request.Container, request.KeepAllAudio, request.ExactMB, request.ReplaceOriginal, request.RequestedEncoder)
 		if err != nil {
-			status := http.StatusBadRequest
-			if errors.Is(err, ErrJobPersistence) {
-				status = http.StatusInternalServerError
-			} else if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "already targets") {
-				status = http.StatusConflict
-			}
-			writeError(w, status, err.Error())
+			writeError(w, jobErrorStatus(err), err.Error())
 			return
 		}
 		writeJSON(w, http.StatusAccepted, job)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func (s *Server) batchJobs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/json") {
+		writeError(w, http.StatusUnsupportedMediaType, "content type must be application/json")
+		return
+	}
+	var request createBatchRequest
+	if err := decodeJSON(w, r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid batch request")
+		return
+	}
+	jobs, err := s.jobs.SubmitBatch(request.RootID, request.Paths, request.Preset, request.Container, request.KeepAllAudio, request.ExactMB, request.ReplaceOriginal, request.RequestedEncoder)
+	if err != nil {
+		writeError(w, jobErrorStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"batch_id": jobs[0].BatchID, "jobs": jobs})
+}
+
+func jobErrorStatus(err error) int {
+	if errors.Is(err, ErrJobPersistence) {
+		return http.StatusInternalServerError
+	}
+	if errors.Is(err, ErrJobConflict) || strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "already targets") {
+		return http.StatusConflict
+	}
+	return http.StatusBadRequest
 }
 
 func (s *Server) jobHistory(w http.ResponseWriter, r *http.Request) {
@@ -237,6 +280,41 @@ func (s *Server) jobAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
+}
+
+func (s *Server) batchAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	remainder := strings.TrimPrefix(r.URL.Path, "/api/batches/")
+	id, action := path.Split(remainder)
+	id = strings.TrimSuffix(id, "/")
+	if id == "" || action != "cancel" || strings.Contains(id, "/") || !validBatchID(id) {
+		http.NotFound(w, r)
+		return
+	}
+	if !strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/json") {
+		writeError(w, http.StatusUnsupportedMediaType, "content type must be application/json")
+		return
+	}
+	var request cancelBatchRequest
+	if err := decodeJSON(w, r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid batch cancellation request")
+		return
+	}
+	result, err := s.jobs.CancelBatch(id, request.CancelRunning)
+	if err != nil {
+		status := http.StatusConflict
+		if err.Error() == "batch not found" {
+			status = http.StatusNotFound
+		} else if errors.Is(err, ErrJobPersistence) {
+			status = http.StatusInternalServerError
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) error {

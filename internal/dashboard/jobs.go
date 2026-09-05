@@ -74,11 +74,36 @@ type Job struct {
 	OriginalKept         bool        `json:"original_kept,omitempty"`
 	FinalPath            string      `json:"final_path,omitempty"`
 	TransactionID        string      `json:"transaction_id,omitempty"`
+	BatchID              string      `json:"batch_id,omitempty"`
+	BatchIndex           int         `json:"batch_index,omitempty"`
+	BatchSize            int         `json:"batch_size,omitempty"`
 
 	cancel              context.CancelFunc
 	outputAbs           string
 	lastProgressPersist time.Time
 	reservationKeys     []string
+}
+
+const MaxBatchSize = 100
+
+var ErrJobConflict = errors.New("job target conflict")
+
+type BatchCancelResult struct {
+	QueuedCancelled  int  `json:"queued_cancelled"`
+	RunningCancelled bool `json:"running_cancelled"`
+}
+
+type validatedJobSpec struct {
+	mediaRoot       *MediaRoot
+	source          string
+	clean           string
+	output          string
+	relOutput       string
+	info            os.FileInfo
+	target          int64
+	quality         string
+	initialDisk     DiskSpaceStatus
+	reservationKeys []string
 }
 
 type RunResult struct {
@@ -406,6 +431,175 @@ func (m *JobManager) SubmitWithReplace(rootID, path, preset, container string, k
 	return m.submit(rootID, path, preset, container, keepAllAudio, exactMB, replaceOriginal, requestedEncoder)
 }
 
+func (m *JobManager) SubmitBatch(rootID string, paths []string, preset, container string, keepAllAudio bool, exactMB int64, replaceOriginal bool, requestedEncoder string) ([]*Job, error) {
+	if len(paths) == 0 {
+		return nil, errors.New("batch must contain at least one movie")
+	}
+	if len(paths) > MaxBatchSize {
+		return nil, fmt.Errorf("batch exceeds the %d movie limit", MaxBatchSize)
+	}
+	if requestedEncoder == "" {
+		requestedEncoder = "auto"
+	}
+	if !validRequestedEncoder(requestedEncoder) {
+		return nil, errors.New("encoder must be auto, software, qsv, vaapi, or nvenc")
+	}
+	if container != "mkv" && container != "mp4" {
+		return nil, errors.New("container must be mkv or mp4")
+	}
+	mediaRoot, err := m.roots.Get(rootID)
+	if err != nil {
+		return nil, ErrUnknownRoot
+	}
+
+	specs := make([]validatedJobSpec, 0, len(paths))
+	seenSources := make(map[string]bool, len(paths))
+	seenReservations := make(map[string]bool, len(paths)*2)
+	for _, moviePath := range paths {
+		spec, err := m.validateJobSpec(mediaRoot, moviePath, preset, container, exactMB, replaceOriginal)
+		if err != nil {
+			return nil, fmt.Errorf("movie %q: %w", moviePath, err)
+		}
+		if seenSources[spec.source] {
+			return nil, fmt.Errorf("movie %q: duplicate source path", moviePath)
+		}
+		seenSources[spec.source] = true
+		for _, key := range spec.reservationKeys {
+			if seenReservations[key] {
+				return nil, fmt.Errorf("movie %q: another movie in this batch targets the same path: %w", moviePath, ErrJobConflict)
+			}
+			seenReservations[key] = true
+		}
+		specs = append(specs, spec)
+	}
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil, errors.New("job queue is shutting down")
+	}
+	if uint64(len(specs)) > math.MaxUint64-m.nextID {
+		m.mu.Unlock()
+		return nil, errors.New("job ID space is exhausted")
+	}
+	for index := range specs {
+		if err := validateJobSpecStillCurrent(&specs[index]); err != nil {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("movie %q: %w", paths[index], err)
+		}
+		if reservedPath(m.reserved, specs[index].reservationKeys) {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("movie %q: a queued or running job already uses its source or output: %w", paths[index], ErrJobConflict)
+		}
+	}
+
+	batchID := newBatchID()
+	for batchIDExists(m.jobs, batchID) {
+		batchID = newBatchID()
+	}
+	oldJobsLen, oldPendingLen := len(m.jobs), len(m.pending)
+	oldNextID, oldRevision := m.nextID, m.persistenceRevision
+	queuedAt := time.Now().UTC()
+	created := make([]*Job, 0, len(specs))
+	for index, spec := range specs {
+		m.nextID++
+		job := &Job{
+			ID: strconv.FormatUint(m.nextID, 10), RootID: spec.mediaRoot.ID, RootLabel: spec.mediaRoot.Label,
+			Path: spec.clean, Filename: filepathBase(spec.clean), OutputPath: spec.relOutput,
+			OriginalSize: spec.info.Size(), Settings: JobSettings{Preset: preset, Quality: spec.quality, Container: container, KeepAllAudio: keepAllAudio, TargetMB: spec.target, RequestedEncoder: requestedEncoder, ReplaceOriginal: replaceOriginal},
+			State: StateQueued, Stage: "Waiting", QueuedAt: queuedAt, Logs: []string{}, outputAbs: spec.output,
+			OriginalKept: replaceOriginal, FinalPath: spec.relOutput, reservationKeys: spec.reservationKeys,
+			DiskAvailableBytes: spec.initialDisk.AvailableBytes, DiskRequiredBytes: spec.initialDisk.RequiredBytes,
+			DiskSafetyReserve: spec.initialDisk.ReserveBytes, DiskSpaceWarning: spec.initialDisk.Warning,
+			BatchID: batchID, BatchIndex: index + 1, BatchSize: len(specs),
+		}
+		if replaceOriginal {
+			job.TransactionID = newTransactionID(job.ID)
+		}
+		m.jobs = append(m.jobs, job)
+		m.pending = append(m.pending, job)
+		reservePaths(m.reserved, job.reservationKeys)
+		created = append(created, job)
+	}
+	m.markPersistenceDirtyLocked()
+	if m.store != nil {
+		if err := m.store.Save(m.persistenceSnapshotLocked()); err != nil {
+			for _, job := range created {
+				releasePaths(m.reserved, job.reservationKeys)
+			}
+			m.jobs = m.jobs[:oldJobsLen]
+			m.pending = m.pending[:oldPendingLen]
+			m.nextID = oldNextID
+			m.persistenceRevision = oldRevision
+			m.mu.Unlock()
+			log.Printf("ERROR: could not persist submitted batch: %v", err)
+			return nil, fmt.Errorf("could not persist the submitted batch: %w", ErrJobPersistence)
+		}
+	}
+	result := make([]*Job, 0, len(created))
+	for _, job := range created {
+		result = append(result, cloneJob(job, queuedAt))
+	}
+	m.cond.Signal()
+	m.mu.Unlock()
+	return result, nil
+}
+
+func (m *JobManager) validateJobSpec(mediaRoot *MediaRoot, moviePath, preset, container string, exactMB int64, replaceOriginal bool) (validatedJobSpec, error) {
+	source, clean, err := mediaRoot.Root.ResolveVideo(moviePath)
+	if err != nil {
+		return validatedJobSpec{}, ErrInvalidPath
+	}
+	info, err := os.Stat(source)
+	if err != nil || !info.Mode().IsRegular() {
+		return validatedJobSpec{}, ErrInvalidPath
+	}
+	target, quality, err := CalculatePresetMB(info.Size(), preset, exactMB)
+	if err != nil {
+		return validatedJobSpec{}, err
+	}
+	output := intendedOutputPath(source, container, replaceOriginal)
+	if output != source {
+		if _, err := os.Lstat(output); err == nil {
+			return validatedJobSpec{}, fmt.Errorf("intended output already exists: %w", ErrJobConflict)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return validatedJobSpec{}, errors.New("could not inspect intended output")
+		}
+	}
+	relOutput, err := filepathRelSlash(mediaRoot.Root.Path(), output)
+	if err != nil {
+		return validatedJobSpec{}, errors.New("invalid intended output")
+	}
+	var initialDisk DiskSpaceStatus
+	if m.diskSpace != nil {
+		initialDisk, _ = m.diskSpace.Check(filepath.Dir(output), TargetBytesFromMB(target))
+	}
+	return validatedJobSpec{
+		mediaRoot: mediaRoot, source: source, clean: clean, output: output, relOutput: relOutput,
+		info: info, target: target, quality: quality, initialDisk: initialDisk,
+		reservationKeys: jobReservationKeys(source, output),
+	}, nil
+}
+
+func validateJobSpecStillCurrent(spec *validatedJobSpec) error {
+	source, clean, err := spec.mediaRoot.Root.ResolveVideo(spec.clean)
+	if err != nil || source != spec.source || clean != spec.clean {
+		return errors.New("source movie changed during batch validation")
+	}
+	info, err := os.Stat(source)
+	if err != nil || !info.Mode().IsRegular() || !os.SameFile(info, spec.info) || info.Size() != spec.info.Size() {
+		return errors.New("source movie changed during batch validation")
+	}
+	if spec.output != spec.source {
+		if _, err := os.Lstat(spec.output); err == nil {
+			return fmt.Errorf("intended output already exists: %w", ErrJobConflict)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return errors.New("could not inspect intended output")
+		}
+	}
+	return nil
+}
+
 func (m *JobManager) submit(rootID, path, preset, container string, keepAllAudio bool, exactMB int64, replaceOriginal bool, requestedEncoder string) (*Job, error) {
 	if !validRequestedEncoder(requestedEncoder) {
 		return nil, errors.New("encoder must be auto, software, qsv, vaapi, or nvenc")
@@ -451,7 +645,7 @@ func (m *JobManager) submit(rootID, path, preset, container string, keepAllAudio
 		m.mu.Unlock()
 		return nil, errors.New("job queue is shutting down")
 	}
-	reservationKeys := replacementReservationKeys(source, output, replaceOriginal)
+	reservationKeys := jobReservationKeys(source, output)
 	if reservedPath(m.reserved, reservationKeys) {
 		m.mu.Unlock()
 		return nil, errors.New("a job already targets that output")
@@ -508,9 +702,9 @@ func intendedOutputPath(source, container string, replaceOriginal bool) string {
 	return outputPath(source, container)
 }
 
-func replacementReservationKeys(source, output string, replaceOriginal bool) []string {
+func jobReservationKeys(source, output string) []string {
 	keys := []string{output}
-	if replaceOriginal && source != output {
+	if source != output {
 		keys = append(keys, source)
 	}
 	return keys
@@ -543,6 +737,37 @@ func newTransactionID(jobID string) string {
 		return jobID + "-" + hex.EncodeToString(random)
 	}
 	return fmt.Sprintf("%s-%d", jobID, time.Now().UnixNano())
+}
+
+func newBatchID() string {
+	random := make([]byte, 12)
+	if _, err := rand.Read(random); err == nil {
+		return "batch-" + hex.EncodeToString(random)
+	}
+	return fmt.Sprintf("batch-%x", time.Now().UnixNano())
+}
+
+func batchIDExists(jobs []*Job, batchID string) bool {
+	for _, job := range jobs {
+		if job.BatchID == batchID {
+			return true
+		}
+	}
+	return false
+}
+
+func validBatchID(value string) bool {
+	if !strings.HasPrefix(value, "batch-") || len(value) < len("batch-")+8 || len(value) > len("batch-")+64 {
+		return false
+	}
+	for _, character := range strings.TrimPrefix(value, "batch-") {
+		if character < '0' || character > '9' {
+			if character < 'a' || character > 'f' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func validTransactionID(value string) bool {
@@ -618,6 +843,57 @@ func (m *JobManager) Cancel(id string) error {
 	}
 	m.mu.Unlock()
 	return errors.New("job not found")
+}
+
+func (m *JobManager) CancelBatch(batchID string, cancelRunning bool) (BatchCancelResult, error) {
+	if !validBatchID(batchID) {
+		return BatchCancelResult{}, errors.New("batch not found")
+	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return BatchCancelResult{}, errors.New("job queue is shutting down")
+	}
+	matched := false
+	result := BatchCancelResult{}
+	now := time.Now().UTC()
+	for _, job := range m.jobs {
+		if job.BatchID != batchID {
+			continue
+		}
+		matched = true
+		switch job.State {
+		case StateQueued:
+			job.State, job.Stage, job.FinishedAt = StateCancelled, "Cancelled", &now
+			releasePaths(m.reserved, job.reservationKeys)
+			m.removePendingLocked(job)
+			result.QueuedCancelled++
+		case StateRunning:
+			if cancelRunning && job.cancel != nil {
+				job.cancel()
+				result.RunningCancelled = true
+			}
+		}
+	}
+	if !matched {
+		m.mu.Unlock()
+		return BatchCancelResult{}, errors.New("batch not found")
+	}
+	if result.QueuedCancelled == 0 && !result.RunningCancelled {
+		m.mu.Unlock()
+		return BatchCancelResult{}, errors.New("batch has no cancellable jobs")
+	}
+	pruneTerminalHistory(&m.jobs)
+	m.markPersistenceDirtyLocked()
+	snapshot := m.persistenceSnapshotLocked()
+	m.mu.Unlock()
+	if m.store != nil {
+		if err := m.store.Save(snapshot); err != nil {
+			log.Printf("ERROR: could not persist batch cancellation: %v", err)
+			return result, fmt.Errorf("batch was cancelled, but its history could not be persisted: %w", ErrJobPersistence)
+		}
+	}
+	return result, nil
 }
 
 func (m *JobManager) removePendingLocked(target *Job) {

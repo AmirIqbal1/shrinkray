@@ -156,7 +156,10 @@ func (s *jobStateStore) Save(snapshot jobStateSnapshot) error {
 	}
 	keepTemporary = true
 	if err := os.Chmod(s.path, 0o600); err != nil {
-		return fmt.Errorf("set job state permissions: %w", err)
+		// The temporary file was already mode 0600 before the atomic rename. A
+		// post-rename chmod failure must not report that persistence failed after
+		// the new state is already visible on disk.
+		log.Printf("WARNING: could not re-apply job state permissions after replacement: %v", err)
 	}
 	if directory, err := os.Open(s.directory); err == nil {
 		if syncErr := directory.Sync(); syncErr != nil {
@@ -298,7 +301,7 @@ func (m *JobManager) restoreQueuedJob(job *Job, recoveryTime time.Time) error {
 	}
 	mediaRoot, _ := m.roots.Get(job.RootID)
 	source, _, _ := mediaRoot.Root.ResolveVideo(job.Path)
-	keys := replacementReservationKeys(source, output, job.Settings.ReplaceOriginal)
+	keys := jobReservationKeys(source, output)
 	if reservedPath(m.reserved, keys) {
 		return errors.New("Queued job could not be restored because another queued job targets the same output.")
 	}

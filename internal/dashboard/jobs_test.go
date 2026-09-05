@@ -300,7 +300,7 @@ func TestReplacementDefaultsOffAndKeepsShrunkOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if job.Settings.ReplaceOriginal || job.OutputPath != "movie.shrunk.mkv" || job.SourceReplaced {
+	if job.Settings.ReplaceOriginal || job.OutputPath != "movie.shrunk.mkv" || job.SourceReplaced || job.BatchID != "" || job.BatchIndex != 0 || job.BatchSize != 0 {
 		t.Fatalf("default job unexpectedly enabled replacement: %#v", job)
 	}
 	<-runner.started

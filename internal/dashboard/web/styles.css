@@ -47,9 +47,19 @@ main { width: min(1280px, calc(100% - 56px)); margin: 34px auto 80px; }
 .breadcrumbs { min-height: 39px; padding: 9px 24px; display: flex; align-items: center; gap: 7px; border-block: 1px solid var(--line); background: #f6f8f6; overflow-x: auto; }
 .breadcrumbs button { padding: 0; border: 0; background: none; color: var(--green); font-size: 12px; font-weight: 700; white-space: nowrap; cursor: pointer; }
 .breadcrumbs span { color: #a5ada9; }
+.selection-toolbar { min-height: 45px; padding: 7px 24px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); }
+.selection-toolbar strong { font-size: 11px; }
+.selection-toolbar span { display: flex; gap: 6px; }
+.selection-toolbar button { min-height: 32px; padding: 6px 9px; border: 1px solid #cfd6d2; border-radius: 7px; background: white; color: var(--green); font-size: 10px; font-weight: 750; cursor: pointer; }
+.selection-toolbar button:disabled { opacity: .45; cursor: default; }
 .file-list { min-height: 440px; max-height: 600px; padding: 8px 12px 14px; overflow-y: auto; }
 .file-row { width: 100%; min-height: 54px; padding: 9px 12px; display: grid; grid-template-columns: 34px minmax(0, 1fr) auto 18px; gap: 9px; align-items: center; border: 0; border-bottom: 1px solid #edf0ed; background: transparent; text-align: left; border-radius: 8px; cursor: pointer; }
-.file-row:hover, .file-row.selected { background: var(--green-soft); }
+.file-row:hover, .file-row.inspected, .file-row.batch-selected { background: var(--green-soft); }
+.file-row.file { padding: 0; grid-template-columns: 44px minmax(0, 1fr); gap: 0; cursor: default; }
+.file-row.inspected { box-shadow: inset 3px 0 0 var(--green); }
+.movie-select { min-width: 44px; min-height: 54px; display: grid; place-items: center; cursor: pointer; }
+.movie-select input { width: 18px; height: 18px; accent-color: var(--green); cursor: pointer; }
+.file-inspect { min-width: 0; min-height: 54px; padding: 9px 12px 9px 0; display: grid; grid-template-columns: 34px minmax(0, 1fr) auto 18px; gap: 9px; align-items: center; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
 .file-icon { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 8px; color: var(--green); background: #eaf3ee; font-size: 12px; }
 .directory .file-icon { background: #eef0e8; color: #687050; font-size: 19px; }
 .file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 650; }
@@ -84,6 +94,7 @@ legend { padding: 0 0 10px; font-size: 11px; font-weight: 800; text-transform: u
 .exact-input { display: flex; align-items: center; gap: 4px; margin-top: 3px; }
 .exact-input input { width: 64px; height: 24px; border: 1px solid #ccd4cf; border-radius: 5px; padding: 2px 5px; font-size: 11px; }
 .exact-input small { margin: 0; }
+.exact-batch-helper { margin-top: 9px; color: var(--green); font-size: 10px; font-weight: 700; }
 .select-row { margin-top: 17px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
 .select-row label { color: var(--muted); font-size: 10px; font-weight: 700; }
 .replace-original-option { margin-top: 16px; display: flex; align-items: flex-start; gap: 9px; color: var(--text); cursor: pointer; }
@@ -98,6 +109,7 @@ select { width: 100%; height: 38px; margin-top: 5px; padding: 0 10px; border: 1p
 .primary { width: 100%; height: 43px; border: 0; border-radius: 8px; background: var(--green); color: white; font-size: 12px; font-weight: 800; cursor: pointer; }
 .primary:hover { background: var(--green-dark); }
 .primary span { margin-left: 7px; color: var(--lime); }
+.primary #queue-submit-label { margin-left: 0; color: inherit; }
 
 .queue-section { margin-top: 38px; }
 .queue-heading { margin-bottom: 14px; display: flex; align-items: end; justify-content: space-between; }
@@ -109,6 +121,13 @@ select { width: 100%; height: 38px; margin-top: 5px; padding: 0 10px; border: 1p
 .clear-history { padding: 8px 11px; border: 1px solid #cfd6d2; border-radius: 7px; background: white; color: var(--muted); font-size: 10px; font-weight: 750; cursor: pointer; }
 .clear-history:hover { border-color: var(--danger); color: var(--danger); }
 .queue-empty { padding: 42px; border: 1px dashed #ccd5cf; border-radius: 12px; background: white; }
+.batch-summary { padding: 14px 18px; border: 1px solid #bcd5c8; border-radius: 12px; background: #f1f7f3; }
+.batch-summary-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.batch-summary-heading strong, .batch-summary-heading small { display: block; }
+.batch-summary-heading strong { font-size: 13px; }
+.batch-summary-heading small { margin-top: 3px; color: var(--muted); font-size: 10px; }
+.batch-progress { margin-top: 11px; }
+.batch-context { color: var(--green); font-size: 9px; font-weight: 750; white-space: nowrap; }
 .job { padding: 16px 18px; border: 1px solid var(--line); border-radius: 12px; background: white; box-shadow: 0 5px 18px rgba(25,54,43,.04); }
 .job.running { border-left: 4px solid var(--green); }
 .job.failed { border-left: 4px solid var(--danger); }
@@ -170,6 +189,9 @@ footer span { margin: 0 8px; color: var(--green); }
   .section-heading { padding-inline: 17px; }
   .library-selector { padding-inline: 17px; }
   .breadcrumbs { padding-inline: 17px; }
+  .selection-toolbar { padding-inline: 17px; align-items: flex-start; flex-direction: column; }
+  .selection-toolbar span { width: 100%; }
+  .selection-toolbar button { flex: 1; min-height: 38px; }
   .preset-grid, .select-row { grid-template-columns: 1fr; }
   fieldset { padding-inline: 17px; }
   .detail-grid { grid-template-columns: repeat(2, 1fr); margin-inline: 17px; }
@@ -181,6 +203,7 @@ footer span { margin: 0 8px; color: var(--green); }
   .progress-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; }
   .progress-labels { align-items: flex-start; flex-direction: column; gap: 2px; }
   .disk-space { align-items: flex-start; flex-direction: column; gap: 2px; }
+  .batch-summary-heading { align-items: flex-start; flex-direction: column; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; }

@@ -139,6 +139,60 @@ func TestQueuedJobsAndOrderSurviveRestart(t *testing.T) {
 	waitForStartedID(t, restoredRunner, third.ID)
 }
 
+func TestBatchMetadataAndQueuedOrderSurviveRestart(t *testing.T) {
+	mediaDir, stateDir := t.TempDir(), t.TempDir()
+	runner := newControlledRunner()
+	manager := persistentManagerFixture(t, mediaDir, stateDir, runner)
+	for _, name := range []string{"first.mkv", "second.mkv", "third.mkv"} {
+		writeTestFile(t, filepath.Join(mediaDir, name))
+	}
+	jobs, err := manager.SubmitBatch("movies", []string{"first.mkv", "second.mkv", "third.mkv"}, "balanced", "mkv", false, 0, false, "auto")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStartedID(t, runner, jobs[0].ID)
+	manager.Close()
+
+	restoredRunner := newControlledRunner()
+	restored := persistentManagerFixture(t, mediaDir, stateDir, restoredRunner)
+	defer restored.Close()
+	for index, submitted := range jobs {
+		job := findJob(t, restored, submitted.ID)
+		if job.BatchID != jobs[0].BatchID || job.BatchIndex != index+1 || job.BatchSize != 3 {
+			t.Fatalf("restored batch metadata for job %s = %#v", job.ID, job)
+		}
+	}
+	waitForStartedID(t, restoredRunner, jobs[1].ID)
+	restoredRunner.release <- struct{}{}
+	waitForState(t, restored, jobs[1].ID, StateCompleted)
+	waitForStartedID(t, restoredRunner, jobs[2].ID)
+}
+
+func TestInvalidRecoveredBatchMemberDoesNotDiscardRemainingMembers(t *testing.T) {
+	mediaDir, stateDir := t.TempDir(), t.TempDir()
+	writeTestFile(t, filepath.Join(mediaDir, "valid.mkv"))
+	queuedAt := time.Now().UTC()
+	batchID := "batch-0123456789abcdef"
+	jobs := []*Job{
+		{ID: "1", RootID: "movies", RootLabel: "Movies", Path: "missing.mkv", Filename: "missing.mkv", OutputPath: "missing.shrunk.mkv", Settings: JobSettings{Preset: "balanced", Quality: "good", Container: "mkv", TargetMB: 1, RequestedEncoder: "auto"}, State: StateQueued, Stage: "Waiting", QueuedAt: queuedAt, Logs: []string{}, BatchID: batchID, BatchIndex: 1, BatchSize: 2},
+		{ID: "2", RootID: "movies", RootLabel: "Movies", Path: "valid.mkv", Filename: "valid.mkv", OutputPath: "valid.shrunk.mkv", OriginalSize: 5, Settings: JobSettings{Preset: "balanced", Quality: "good", Container: "mkv", TargetMB: 1, RequestedEncoder: "auto"}, State: StateQueued, Stage: "Waiting", QueuedAt: queuedAt, Logs: []string{}, BatchID: batchID, BatchIndex: 2, BatchSize: 2},
+	}
+	store := newJobStateStore(stateDir)
+	if err := store.Save(jobStateSnapshot{revision: 1, state: persistedJobState{Version: jobStateVersion, NextID: 3, Jobs: jobs}}); err != nil {
+		t.Fatal(err)
+	}
+	runner := newControlledRunner()
+	manager := persistentManagerFixture(t, mediaDir, stateDir, runner)
+	defer manager.Close()
+	if invalid := findJob(t, manager, "1"); invalid.State != StateFailed || invalid.BatchID != batchID {
+		t.Fatalf("invalid recovered member = %#v", invalid)
+	}
+	waitForStartedID(t, runner, "2")
+	if valid := findJob(t, manager, "2"); valid.BatchID != batchID || valid.BatchIndex != 2 {
+		t.Fatalf("valid recovered member lost batch metadata: %#v", valid)
+	}
+}
+
 func TestInterruptedJobPreservesProgressAndSafelyCleansOnlyPart(t *testing.T) {
 	mediaDir, stateDir := t.TempDir(), t.TempDir()
 	runner := newControlledRunner()
@@ -492,7 +546,7 @@ func TestLegacyJobDefaultsReplacementOff(t *testing.T) {
 	manager := persistentManagerFixture(t, mediaDir, stateDir, newControlledRunner())
 	defer manager.Close()
 	job := findJob(t, manager, "1")
-	if job.Settings.ReplaceOriginal || job.SourceReplaced || job.OriginalKept {
+	if job.Settings.ReplaceOriginal || job.SourceReplaced || job.OriginalKept || job.BatchID != "" || job.BatchIndex != 0 || job.BatchSize != 0 {
 		t.Fatalf("legacy job enabled replacement fields: %#v", job)
 	}
 }
